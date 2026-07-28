@@ -309,6 +309,21 @@ code is still non-zero if any node failed, so you can use either signal:
 done
 ```
 
+**Fleet state** has its own, wider row — it answers questions the summary
+cannot (model, eligibility, pin state):
+
+```
+fleetctl-node<TAB>name<TAB>reachable|unreachable<TAB>model<TAB>eligible|ineligible<TAB>pin<TAB>detail
+```
+
+```sh
+"$FLEETCTL" --porcelain nodes | while IFS="$(printf '\t')" read -r _ name state model elig pin _; do
+  [ "$state" = "reachable" ] && [ "$elig" = "eligible" ] && echo "$name ($model) can take the addon"
+done
+```
+
+Same append-only rule: columns are never reordered or repurposed.
+
 **Library mode**, if you want fleetctl's plumbing rather than its verbs:
 
 ```sh

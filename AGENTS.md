@@ -79,8 +79,14 @@ fleetctl is meant to be **depended on, not vendored** — addons like
 flowcache-doctor call it rather than copying it. Two surfaces are therefore
 public:
 
-- **`--porcelain`**: `fleetctl<TAB>node<TAB>OK|FAIL|SKIPPED<TAB>reason`, one row
-  per node. Never reorder or repurpose a column; append if you must add one.
+- **`--porcelain`**, two row shapes, both append-only — never reorder or
+  repurpose a column:
+  - fan-out verbs (`run`/`push`/`install`):
+    `fleetctl<TAB>node<TAB>OK|FAIL|SKIPPED<TAB>reason`
+  - `nodes`:
+    `fleetctl-node<TAB>name<TAB>reachable|unreachable<TAB>model<TAB>eligible|ineligible<TAB>pin<TAB>detail`
+  A distinct leading tag per shape, so a consumer can tell them apart and new
+  shapes can be added without breaking existing parsers.
 - **Library mode**: `FLEETCTL_LIB=1 . fleetctl` loads without running a verb and
   exposes `fleet_version`, `fleet_platform`, `fleet_list`, `fleet_spec`,
   `fleet_probe`, `fleet_eligible`, `fleet_gate`, `fleet_exec`. Those names are

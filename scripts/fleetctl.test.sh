@@ -468,6 +468,15 @@ reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.3,mac=AA:BB:CC
 out=$(run --porcelain install https://example.invalid/addon.sh 2>&1)
 has  "porcelain: SKIPPED is machine-readable"   "$out" "$(printf 'fleetctl\t192.168.1.3\tSKIPPED')"
 
+# `nodes` is the fleet-state query a consumer most wants to parse
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2,mac=AA:BB:CC:DD:EE:02 192.168.1.3,mac=AA:BB:CC:DD:EE:03 192.168.1.9"'
+out=$(run --porcelain nodes 2>&1); rc=$?
+has  "porcelain nodes: eligible row"            "$out" "$(printf 'fleetctl-node\t192.168.1.2\treachable\tRT-NODE-A\teligible\tpin-ok')"
+has  "porcelain nodes: ineligible row"          "$out" "$(printf 'fleetctl-node\t192.168.1.3\treachable\tRP-NODE-B\tineligible')"
+has  "porcelain nodes: unreachable row"         "$out" "$(printf 'fleetctl-node\t192.168.1.9\tunreachable')"
+hasnt "porcelain nodes: no human header"        "$out" "configured nodes"
+nonzero "porcelain nodes: exit code preserved"  "$rc"
+
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2,mac=AA:BB:CC:DD:EE:02"'
 out=$(FLEETCTL_LIB=1 "$SH" -c '. "$1"; fleet_spec 192.168.1.2,mac=AA:BB:CC:DD:EE:02,name=alpha; echo "$SPEC_NAME/$SPEC_MAC"; fleet_version' _ "$FLEETCTL" 2>&1)
 has  "lib mode: sourcing exposes fleet_spec"    "$out" "alpha/AA:BB:CC:DD:EE:02"

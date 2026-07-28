@@ -706,8 +706,16 @@ EOF
 
 cmd_nodes() {
   _nodes_or_die
-  echo "fleetctl $VERSION — configured nodes (default user: ${FLEET_USER:-<from ~/.ssh/config>}, port: $FLEET_PORT):"
-  echo
+  # `nodes` is the natural "what does my fleet look like" query, so it is the
+  # one a consuming addon most wants to parse. Its porcelain form is a WIDER
+  # row than the fan-out summary — it answers questions the summary cannot
+  # (model, eligibility, pin state) — so it carries its own leading tag:
+  #   fleetctl-node<TAB>name<TAB>reachable|unreachable<TAB>model<TAB>eligible|ineligible<TAB>pin<TAB>detail
+  # Same rule as the summary contract: columns are append-only, never reordered.
+  if [ "$PORCELAIN" != "1" ]; then
+    echo "fleetctl $VERSION — configured nodes (default user: ${FLEET_USER:-<from ~/.ssh/config>}, port: $FLEET_PORT):"
+    echo
+  fi
   rc=0
   for spec in $FLEET_NODES; do
     _parse_spec "$spec"
@@ -715,13 +723,21 @@ cmd_nodes() {
       _pinstate="unpinned"
       if [ -n "$SPEC_MAC" ]; then _pin_matches && _pinstate="pin ok" || { _pinstate="PIN MISMATCH"; rc=1; }; fi
       _self=""; _is_self && _self=" [controller]"
-      if _eligible; then
+      _elig=ineligible; _eligible && _elig=eligible
+      if [ "$PORCELAIN" = "1" ]; then
+        printf 'fleetctl-node\t%s\treachable\t%s\t%s\t%s\t%s\n' \
+          "$SPEC_NAME" "$P_MODEL" "$_elig" "$(echo "$_pinstate" | tr ' ' '-')" "${_self# }"
+      elif [ "$_elig" = "eligible" ]; then
         printf '  %-18s %-10s auth: ok    merlin: yes  %s%s\n' "$SPEC_NAME" "$P_MODEL" "$_pinstate" "$_self"
       else
         printf '  %-18s %-10s auth: ok    merlin: no   %s%s  (run only)\n' "$SPEC_NAME" "$P_MODEL" "$_pinstate" "$_self"
       fi
     else
-      printf '  %-18s %-10s auth: FAIL  %s\n' "$SPEC_NAME" "-" "$P_REASON"
+      if [ "$PORCELAIN" = "1" ]; then
+        printf 'fleetctl-node\t%s\tunreachable\t\t\t\t%s\n' "$SPEC_NAME" "$P_REASON"
+      else
+        printf '  %-18s %-10s auth: FAIL  %s\n' "$SPEC_NAME" "-" "$P_REASON"
+      fi
       rc=1
     fi
   done
