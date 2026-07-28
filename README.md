@@ -26,8 +26,18 @@ fleetctl install https://raw.githubusercontent.com/<addon>/main/install.sh
   (1 ok, 0 failed, 1 skipped)
 ```
 
-Nothing in fleetctl is addon-specific. Rollout, fleet-wide upgrade, fleet-wide
-state and rollback are all the same generic verbs.
+**Nothing in fleetctl is addon-specific.** Rollout, fleet-wide upgrade,
+fleet-wide state and rollback are all the same generic verbs, and it will fan
+out any installer that meets [the contract](#the-addon-installer-contract) —
+or any bare command you like, on stock AiMesh nodes included.
+
+It was extracted from
+[flowcache-doctor](https://github.com/deviationist/asuswrt-merlin-flowcache-doctor),
+which is its first consumer and the [worked
+example](#worked-example-flowcache-doctor-across-a-mesh) below — but that addon
+gets no special-casing in the code, and the design goal is explicitly the
+general case: put the security-sensitive fan-out machinery in one auditable
+place so no addon has to reinvent it.
 
 ---
 
@@ -213,6 +223,55 @@ addon, it publishes the contract an installer must satisfy to be
 
 [flowcache-doctor](https://github.com/deviationist/asuswrt-merlin-flowcache-doctor)
 is the reference implementation.
+
+## Worked example: flowcache-doctor across a mesh
+
+flowcache-doctor is fleetctl's first consumer and the addon this design was
+extracted from — but it gets **no special-casing whatsoever**. Everything below
+is the generic verbs, and any addon meeting the contract above works the same
+way. That is the point of the tool.
+
+The doctor heals a Broadcom flow-cache bug where a Wi-Fi client loses specific
+wired LAN hosts after a band roam. In a mesh, clients roam *between units*, so
+the addon wants to run on every unit — which used to mean SSHing into each node
+by hand.
+
+```sh
+DOCTOR=https://raw.githubusercontent.com/deviationist/asuswrt-merlin-flowcache-doctor/main/install.sh
+
+# see what would happen, and to which units, before trusting the list
+fleetctl --dry-run install "$DOCTOR"
+
+# roll it out
+fleetctl install "$DOCTOR"
+
+# is it actually working on every unit? (this is the question that matters)
+fleetctl run '/jffs/scripts/roamctl health'
+
+# upgrade the whole mesh — same command, the installer is idempotent
+fleetctl install "$DOCTOR"
+
+# roll the whole mesh back
+fleetctl install "$DOCTOR" uninstall
+```
+
+Four of those five need no addon-specific code at all — `run` covers fleet-wide
+state, and `install` re-run covers upgrade. Note `roamctl health` exits non-zero
+on any FAIL, and fleetctl preserves that per node and in its own exit code, so
+the two compose into one trustworthy answer.
+
+Two caveats specific to this pairing, stated because they change what you
+should expect:
+
+- **A unit that is not Merlin gets skipped, with the reason printed.** In a
+  mixed mesh (a stock AiMesh node is common) the summary will say `SKIPPED`,
+  not `OK` — that is correct behaviour, not a failure to roll out.
+- **Read the per-node installer output, not just the summary.** The doctor
+  auto-detects which Wi-Fi interfaces to watch, and on some hardware that
+  detection can land in an inert configuration while still printing
+  `Installed and HEALING` and exiting 0. Fan-out multiplies confident false
+  positives; fleetctl deliberately prints every node's installer tail so a
+  silent misconfigure stays visible instead of becoming N invisible ones.
 
 ## Enabling JFFS custom scripts on a node
 
