@@ -441,12 +441,12 @@ _probe() {
   if [ -z "$_line" ]; then
     if grep -qi 'host key\|HOST KEY' "$_err" 2>/dev/null; then
       P_REASON="HOST KEY MISMATCH — this address answered with a different SSH host key than last time. A firmware reflash explains it; so does someone else holding that address now. Verify, then remove the stale entry from $FLEET_HOME/.ssh/known_hosts"
-    elif grep -qi "password:" "$_err" 2>/dev/null; then
-      # The unit answered, but nothing we hold opened it, so it asked for a
-      # password. fleetctl never answers prompts uninvited.
-      P_REASON="no usable credentials: the unit fell back to asking for a password. Point FLEET_KEY (or key= on this spec) at a key it accepts — or, if you really want password auth, set FLEET_ALLOW_PASSWORD=1 and auth=pass on the spec"
-    elif grep -qi 'denied\|authentication\|exhausted' "$_err" 2>/dev/null; then
-      P_REASON="SSH auth failed: the credentials in your config were rejected by this unit"
+    elif grep -qiE "password:|no auth method|exhausted|denied|authentication fail" "$_err" 2>/dev/null; then
+      # One condition, several wordings. dbclient says "No auth methods could
+      # be used." when BatchMode is on (verified on hardware 2026-07-28); older
+      # builds without BatchMode instead print "user@host's password:" and wait.
+      # Both mean the same thing to the operator, so say the same thing back.
+      P_REASON="no usable credentials for this unit — it answered, but nothing fleetctl holds opened it. Point FLEET_KEY (or key= on this spec) at a key it accepts. For an AiMesh node, authorizing that key once on the CONTROLLER (Administration -> System -> SSH Authentication key) propagates it to every node"
     else
       # Flatten ALL of stderr into one line rather than taking the first: on a
       # real auth failure dbclient's first line is a bare "dbclient: " and the

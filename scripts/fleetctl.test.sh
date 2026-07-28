@@ -79,6 +79,7 @@ case "$auth" in
   ok) : ;;
   hostkey) echo "Host key mismatch for $host !" >&2; exit 255 ;;
   prompt)  printf "%s@%s's password: " "${target%%@*}" "$host" >&2; exit 255 ;;
+  noauth)  echo "dbclient: Connection to $target exited: No auth methods could be used." >&2; exit 255 ;;
   *) echo "dbclient: Authentication failed" >&2; exit 255 ;;
 esac
 case "$cmd" in
@@ -294,6 +295,14 @@ out=$(run nodes 2>&1)
 has  "password prompt: diagnosed as missing credentials" "$out" "no usable credentials"
 has  "password prompt: says how to fix it"      "$out" "FLEET_KEY"
 hasnt "password prompt: does not echo the prompt back" "$out" "'s password:"
+
+# dbclient with BatchMode phrases the SAME condition differently — one diagnosis
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.8"'
+host_fixture 192.168.1.8 noauth "" "" no "" 0 0
+out=$(run nodes 2>&1)
+has  "no-auth-methods: same diagnosis as a prompt" "$out" "no usable credentials"
+has  "no-auth-methods: points at the mesh-wide fix" "$out" "propagates it to every node"
+hasnt "no-auth-methods: not misreported as unreachable" "$out" "unreachable"
 
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2"'
 run nodes >/dev/null 2>&1
@@ -629,7 +638,7 @@ nonzero "auto: non-ASUS gateway exits non-zero" "$rc"
 reset; withkey; conf "FLEET_KEY=\"$KEY\""
 host_fixture 192.168.1.1 deny "" "" no "" 0 0
 out=$(run discover 2>&1); rc=$?
-has  "auto: surfaces the SSH failure reason"   "$out" "auth failed"
+has  "auto: surfaces the SSH failure reason"   "$out" "no usable credentials"
 nonzero "auto: unreachable gateway exits non-zero" "$rc"
 rm -f "$BIN/route"
 
@@ -672,7 +681,7 @@ has  "health: ineligible node gets an actionable reason" "$out" "is not running 
 
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.4"'
 out=$(run health 2>&1); rc=$?
-has  "health: auth failure names the cause"   "$out" "SSH auth failed"
+has  "health: auth failure names the cause"   "$out" "no usable credentials"
 nonzero "health: unreachable node => non-zero exit" "$rc"
 
 echo
