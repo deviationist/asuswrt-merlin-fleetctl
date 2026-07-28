@@ -216,7 +216,7 @@ reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_CONTROLLER="self"'
 sed -i.bak '/^cfg_device_list=/d' "$NVRAM_STATE"
 out=$(run discover 2>&1); rc=$?
 nonzero "discover: empty list exits non-zero" "$rc"
-has  "discover: empty list explains manual config" "$out" 'FLEET_NODES="192.168.1.2 192.168.1.3"'
+has  "discover: empty list explains what to do next" "$out" 'FLEET_NODES="self"'
 
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_CONTROLLER="self"'
 sed -i.bak 's/^cfg_device_list=.*/cfg_device_list=SOMETHING-UNPARSEABLE-FROM-OTHER-FIRMWARE/' "$NVRAM_STATE"
@@ -484,6 +484,76 @@ VER=$(awk -F= '/^VERSION=/{print $2; exit}' "$FLEETCTL")
 has  "lib mode: fleet_version reports the script version" "$out" "$VER"
 env_out=$(FLEETCTL_LIB=1 "$SH" "$FLEETCTL" run 'echo SHOULD-NOT-RUN' 2>&1)
 hasnt "lib mode: loading never executes a verb" "$env_out" "SHOULD-NOT-RUN"
+
+# === single-device / passthrough ============================================
+echo "-- single device"
+# A fleet of one is the common case for a consuming addon's user. On a router,
+# an unconfigured fleet must act on THIS unit rather than erroring.
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES=""'
+out=$(runp router run 'echo SINGLE-DEVICE' 2>&1); rc=$?
+has  "single: unconfigured fleet acts on this unit" "$out" "SINGLE-DEVICE"
+has  "single: says so loudly"                  "$out" "single-device mode"
+is   "single: exits zero"                      "$rc" "0"
+
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES=""'
+out=$(runp router install https://example.invalid/addon.sh 2>&1); rc=$?
+has  "single: install works with no config"    "$out" "Installed and HEALING"
+is   "single: install exits zero"              "$rc" "0"
+
+# the note must not pollute a parser's stdout
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES=""'
+out=$(runp router --porcelain run 'echo X' 2>/dev/null)
+hasnt "single: note goes to stderr, not porcelain stdout" "$out" "single-device mode"
+has  "single: porcelain row still emitted"     "$out" "$(printf 'fleetctl\tself\tOK')"
+
+# off-router there is nothing to fall back to
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES=""'
+out=$(run run 'echo X' 2>&1); rc=$?
+has  "single: workstation with no fleet still errors" "$out" "not a router"
+nonzero "single: workstation empty fleet exits non-zero" "$rc"
+
+# a lone router reports no device list — that must read as "no mesh", not "broken"
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_CONTROLLER="self"'
+sed -i.bak '/^cfg_device_list=/d' "$NVRAM_STATE"
+out=$(runp router discover 2>&1)
+has  "single: no mesh is explained as normal"  "$out" "no mesh here"
+has  "single: suggests the zero-config answer" "$out" "acts on this unit when no fleet is set"
+
+# === controller auto-detection ==============================================
+echo "-- controller auto-detection"
+# workstation, nothing configured: find the router via the default gateway
+cat > "$BIN/route" <<'M'
+#!/bin/sh
+case "$*" in *"get default"*) echo "   gateway: 192.168.1.1";; esac
+M
+chmod +x "$BIN/route"
+reset; withkey; conf "FLEET_KEY=\"$KEY\""
+out=$(run discover 2>&1); rc=$?
+has  "auto: checks the default gateway"        "$out" "checking the default gateway (192.168.1.1)"
+has  "auto: confirms what it found"            "$out" "Found an ASUS unit there"
+has  "auto: proceeds to list nodes"            "$out" "192.168.1.2"
+is   "auto: succeeds with zero config"         "$rc" "0"
+
+# gateway that is not an ASUS unit must not be assumed usable
+reset; withkey; conf "FLEET_KEY=\"$KEY\""
+host_fixture 192.168.1.1 ok "" "" no "" 0 0
+out=$(run discover 2>&1); rc=$?
+has  "auto: refuses a non-ASUS gateway"        "$out" "did not identify as an ASUS unit"
+has  "auto: tells the user how to set it"      "$out" "FLEET_CONTROLLER="
+nonzero "auto: non-ASUS gateway exits non-zero" "$rc"
+
+# unreachable gateway: report the auth/reachability reason, do not guess on
+reset; withkey; conf "FLEET_KEY=\"$KEY\""
+host_fixture 192.168.1.1 deny "" "" no "" 0 0
+out=$(run discover 2>&1); rc=$?
+has  "auto: surfaces the SSH failure reason"   "$out" "auth failed"
+nonzero "auto: unreachable gateway exits non-zero" "$rc"
+rm -f "$BIN/route"
+
+# no route tool at all -> fall back to explicit config, never a wild guess
+reset; withkey; conf "FLEET_KEY=\"$KEY\""
+out=$(PATH="$BIN" run discover 2>&1); rc=$?
+nonzero "auto: no route tool exits non-zero"   "$rc"
 
 # === health =================================================================
 echo "-- health"

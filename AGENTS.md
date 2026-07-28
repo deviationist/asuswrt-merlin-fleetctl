@@ -73,6 +73,29 @@ ordinary identity gate, not a special case. `install` of fleetctl's own
 installer onto a local target is refused outright: that rewrites the running
 script.
 
+## Inference is allowed to be wrong; it is never allowed to be trusted
+
+fleetctl infers what it can (is this machine a router, where is the controller,
+is there a mesh at all) so users need not configure everything. Two rules keep
+that safe:
+
+- **Confirm, then announce.** A guess is checked by ASKING the host what it is
+  (the identity probe), and what was found is printed. Controller
+  auto-detection uses the LAN default gateway as a *candidate* only; if it does
+  not identify as an ASUS unit, or will not authenticate, fleetctl says so and
+  falls back to explicit config. It never proceeds on an unconfirmed guess.
+- **Inference never authorizes.** Nothing mutating may become permitted because
+  fleetctl guessed well. The pin, identity and eligibility gates are unchanged
+  by any auto-detection; discovery is read-only (`nvram get`) regardless.
+
+**Single-device passthrough**: on a ROUTER, an empty `FLEET_NODES` means
+`self` — a consuming addon's `fleetctl install …` must work for the user who
+owns one router, and erroring there would make the feature useless on the most
+common setup. It is announced on **stderr** (so `--porcelain` stdout stays
+parseable) and loudly, because silently acting on the controller when someone
+MEANT to reach their mesh (typo'd conf, wrong file) would be a nasty surprise.
+Off-router there is no fallback: a workstation is not an install target.
+
 ## Public contracts (breaking these breaks consumers)
 
 fleetctl is meant to be **depended on, not vendored** — addons like

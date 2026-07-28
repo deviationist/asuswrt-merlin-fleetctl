@@ -110,6 +110,40 @@ fleetctl nodes                    # auth + eligibility per node
 fleetctl --dry-run run 'uptime'   # confirm the target list before trusting it
 ```
 
+## Zero config where it can be
+
+fleetctl tries to work out what it can rather than making you declare it:
+
+| Question | How it answers |
+|---|---|
+| Is *this machine* an ASUS router? | `/jffs` + an ASUS-only nvram variable, at startup. Decides config paths and whether `self` can be an install target |
+| Is *that target* an ASUS unit? | the per-node identity probe — `install`/`push` refuse anything that does not answer as one |
+| Where is the AiMesh controller? | on a router, itself; on a workstation, the LAN's **default gateway**, confirmed by asking it |
+| What if there is no mesh? | a single router is a fleet of one — see below |
+
+Auto-detection never *assumes*: fleetctl asks the candidate what it is, prints
+what it found, and falls back to a clear "set `FLEET_CONTROLLER`" message if the
+gateway is not an ASUS unit or will not authenticate. Nothing mutating is ever
+authorized on the strength of a guess.
+
+### A fleet of one
+
+Using a fan-out tool on a single device is ironic but legitimate — an addon that
+calls fleetctl should still work for the user who has one router. So on a
+router, an **unconfigured fleet means "this unit"**:
+
+```sh
+fleetctl install https://example.com/addon.sh
+# note: no FLEET_NODES configured — acting on THIS unit only (single-device mode).
+```
+
+Every gate still applies; it is simply a fleet of one. The note goes to stderr,
+so `--porcelain` stdout stays clean for a parser. Off-router there is no such
+fallback — your laptop is not an install target — and you get an error instead.
+
+The single remote device case needs no special support either: one spec in
+`FLEET_NODES` is a perfectly good fleet.
+
 ## Verbs
 
 | Verb | What it does | Needs |
@@ -199,7 +233,7 @@ overwritten:
 | Setting | Default | Notes |
 |---|---|---|
 | `FLEET_NODES` | `""` | the fleet. Runtime source of truth |
-| `FLEET_CONTROLLER` | `self` on a router, else unset | who `discover` asks |
+| `FLEET_CONTROLLER` | `self` on a router; else auto-detected from the default gateway | who `discover` asks |
 | `FLEET_USER` | `nvram http_username` on a router; empty on a workstation | empty = let `~/.ssh/config` decide |
 | `FLEET_PORT` | `nvram sshd_port`, else 22 | |
 | `FLEET_KEY` | `<confdir>/fleetctl.key` | optional; point it at any key you like |
@@ -449,7 +483,8 @@ will be documented here once verified rather than guessed at. Until then,
 | `no MAC pin` | mutating verbs need `mac=` — re-run `fleetctl discover` for pinned specs |
 | `does not match this host` | DHCP moved the address. Re-run `fleetctl discover` |
 | `not Merlin-eligible` | stock node, or JFFS custom scripts off — see above |
-| `cfg_device_list is empty` | not the controller, or no nodes. Populate `FLEET_NODES` by hand |
+| `cfg_device_list is empty` | usually just means there is no mesh — a single router reports no list. See *A fleet of one* |
+| `could not use the default gateway` | auto-detection found something that is not an ASUS unit, or could not log in. Set `FLEET_CONTROLLER` explicitly |
 | `password auth needs a terminal` | a cron/piped invocation cannot prompt. Use key auth |
 
 `fleetctl health` checks all of this in one pass and exits non-zero on any FAIL.

@@ -358,6 +358,38 @@ _run_on() {
   _with_timeout "$_cap" "$SSH_BIN" $(_ssh_opts "$_cap") "$_tgt" "$2"
 }
 
+# The LAN's default gateway — the first guess at "where is the router?".
+# Portable across the three route tools we can expect (iproute2 on Linux,
+# BSD/macOS `route`, `netstat` anywhere). Each is probed with `which` first,
+# because assuming an applet exists is how this project breaks. If none of
+# them are present we simply return nothing and the caller falls back to
+# explicit config — a guess is never load-bearing here.
+_default_gateway() {
+  _gw=""
+  if which ip >/dev/null 2>&1; then
+    _gw=$(ip route 2>/dev/null | awk '/^default/{print $3; exit}')
+  fi
+  if [ -z "$_gw" ] && which route >/dev/null 2>&1; then
+    _gw=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}')
+  fi
+  if [ -z "$_gw" ] && which netstat >/dev/null 2>&1; then
+    _gw=$(netstat -rn 2>/dev/null | awk '/^(default|0\.0\.0\.0)/{print $2; exit}')
+  fi
+  echo "$_gw"
+}
+
+# Ask a candidate host whether it is an ASUS unit that knows a mesh. Read-only
+# (two nvram reads), and its answer is only ever used to SUGGEST a controller —
+# never to authorize anything. Sets AUTO_MODEL / AUTO_REASON.
+_looks_like_controller() {
+  AUTO_MODEL=""; AUTO_REASON=""
+  _parse_spec "$1"
+  if ! _probe; then AUTO_REASON="$P_REASON"; return 1; fi
+  if [ -z "$P_MODEL" ]; then AUTO_REASON="answered SSH, but did not identify as an ASUS unit"; return 1; fi
+  AUTO_MODEL=$P_MODEL
+  return 0
+}
+
 # How this target is being reached, for the per-node headers.
 _target_desc() {
   if [ "$SPEC_LOCAL" = "1" ]; then echo "this machine, run locally"
@@ -476,7 +508,25 @@ _print_summary() {
 # discovery: a discovered list drifts, and a fan-out tool must aim at a stable,
 # user-owned target list).
 _nodes_or_die() {
-  [ -n "$FLEET_NODES" ] || die "FLEET_NODES is empty in $CONF — run 'fleetctl discover' for a conf-ready line, or pass --nodes '<spec> ...'"
+  [ -n "$FLEET_NODES" ] && return 0
+  # SINGLE-DEVICE PASSTHROUGH. A fleet of one is a legitimate (if ironic) way to
+  # use a fan-out tool: a consuming addon calls `fleetctl install …` and the user
+  # simply has one router. Erroring there would make the addon's mesh command
+  # useless on the most common setup, so an unconfigured fleet on a router means
+  # "this unit" — every gate still applies, it is just a fleet of one.
+  #
+  # The note goes to STDERR so --porcelain stdout stays clean for parsers, and
+  # it is loud on purpose: silently acting on the controller when someone MEANT
+  # to reach their mesh (typo'd conf, wrong file) would be a nasty surprise.
+  if [ "$PLATFORM" = "router" ]; then
+    FLEET_NODES=self
+    echo "note: no FLEET_NODES configured — acting on THIS unit only (single-device mode)." >&2
+    echo "      'fleetctl discover' sets up a mesh fan-out if you have one." >&2
+    return 0
+  fi
+  die "FLEET_NODES is empty in $CONF, and this machine is not a router, so there
+is nothing to act on. Run 'fleetctl discover' for a conf-ready line, or pass
+--nodes '<spec> ...'."
 }
 
 # _require_target <mutating?> — shared gate: probe, identify, decide.
@@ -598,11 +648,33 @@ cmd_discover() {
   # always asks the controller — locally when fleetctl runs on it, over SSH
   # when it runs on a workstation. One code path; `self` just happens to be a
   # transport that needs no network.
+  AUTODETECTED=0
   if [ -z "$FLEET_CONTROLLER" ]; then
-    die "discovery asks the AiMesh controller, and this machine is not one.
-Set the controller in $CONF, e.g.:
+    # Nothing configured: try to find the router instead of making the user do
+    # it. The LAN's default gateway is the obvious candidate, but a guess is
+    # only accepted once the host itself confirms what it is — so we ask, and
+    # we say out loud what we found.
+    _gw=$(_default_gateway)
+    if [ -n "$_gw" ]; then
+      echo "No FLEET_CONTROLLER set — checking the default gateway ($_gw)..."
+      if _looks_like_controller "$_gw"; then
+        FLEET_CONTROLLER=$_gw; AUTODETECTED=1
+        echo "Found an ASUS unit there: $AUTO_MODEL. Using it as the controller."
+        echo
+      else
+        die "could not use the default gateway ($_gw) as the AiMesh controller: $AUTO_REASON
+
+Set it explicitly in $CONF once you know which unit it is:
+  FLEET_CONTROLLER=\"$_gw\"              # or a Host alias from ~/.ssh/config
+If SSH auth is the problem, authorize your key on the router first (see README)."
+      fi
+    else
+      die "discovery asks the AiMesh controller, and this machine is not one.
+Could not work out this LAN's default gateway either (no ip/route/netstat?).
+Set the controller in $CONF:
   FLEET_CONTROLLER=\"192.168.1.1\"        # or a Host alias from ~/.ssh/config
 Discovery is only a convenience — you can also just write FLEET_NODES by hand."
+    fi
   fi
   _parse_spec "$FLEET_CONTROLLER"
   CTRL_LOCAL=$SPEC_LOCAL; CTRL_NAME=$SPEC_NAME
@@ -615,14 +687,24 @@ Discovery is only a convenience — you can also just write FLEET_NODES by hand.
   if [ -z "$raw" ]; then
     echo "No AiMesh device list came back from the controller ($CTRL_NAME)."
     echo
-    echo "Either that unit is not the AiMesh controller, or it has no nodes, or"
-    echo "this firmware keeps the list elsewhere — or fleetctl could not reach it"
-    echo "(try: fleetctl --nodes '$FLEET_CONTROLLER' nodes)."
+    echo "Most likely there is simply no mesh here — a single router reports no"
+    echo "device list. It can also mean that unit is not the AiMesh controller,"
+    echo "that this firmware keeps the list elsewhere, or that fleetctl could not"
+    echo "reach it (try: fleetctl --nodes '$FLEET_CONTROLLER' nodes)."
     echo
-    echo "Discovery is a convenience; fleetctl works fully without it. Populate"
-    echo "$CONF by hand:"
-    echo
-    echo '  FLEET_NODES="192.168.1.2 192.168.1.3"'
+    # Key off the CONTROLLER's transport, not the platform: "the controller is
+    # this machine" is exactly when `self` is the right advice.
+    if [ "$CTRL_LOCAL" = "1" ]; then
+      echo "For a single router, you do not need to configure anything at all:"
+      echo "fleetctl acts on this unit when no fleet is set. To be explicit, put"
+      echo "this in $CONF:"
+      echo
+      echo '  FLEET_NODES="self"'
+    else
+      echo "For a single router, point fleetctl straight at it in $CONF:"
+      echo
+      echo "  FLEET_NODES=\"$FLEET_CONTROLLER\""
+    fi
     exit 1
   fi
   # Format (verified on 3006): records '<'-separated, fields '>'-separated:

@@ -290,6 +290,17 @@ Three owner questions reshaped the tool after v0.1 was pushed:
   functions). Prefer the CLI — it is version-tolerant and keeps the safety
   model on your side of the call.
 
+- **"Can it detect whether the host is an ASUS router?"** → it already did
+  (platform detection at startup + the per-target identity probe). The real gap
+  was the workstation having to be TOLD where the controller is, so `discover`
+  now falls back to the LAN default gateway, confirms it by asking, and says
+  what it found. Guesses are confirmed and announced, never trusted.
+- **"What about a single device?"** → on a router, an empty `FLEET_NODES` now
+  means `self` (single-device passthrough), announced on stderr so porcelain
+  stdout stays clean. A consuming addon's mesh command must still work for the
+  user who owns one router. A lone router's empty `cfg_device_list` is now
+  explained as "no mesh here" rather than reading like a fault.
+
 Two more real bugs fell out of this work, both silent-success class and both
 caught by the suite: a background child inherits the parent's stdout, so the
 timeout watchdog held every `$( … )` capture open for its full duration (a 20 s
