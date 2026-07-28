@@ -31,7 +31,7 @@
 #     `install <url> uninstall`).
 #
 # Usage: fleetctl [global flags] <verb> [args]   — see the bottom of this file.
-VERSION=0.2.0
+VERSION=0.3.0
 TAG=fleetctl
 REPO_RAW="https://raw.githubusercontent.com/deviationist/asuswrt-merlin-fleetctl/main"
 UPDATE_TMP=/tmp/fleetctl.update.sh          # transient installer copy for 'update' (RAM)

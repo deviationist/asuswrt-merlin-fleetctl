@@ -269,6 +269,39 @@ Two real usability bugs surfaced that no mock could have caught, both fixed:
 Still unproven on hardware: fleetctl running **on** the router (the
 `PLATFORM=router` paths), and any mutating verb.
 
+**2026-07-28** (EVERY VERB RUN ON THE PRODUCTION ROUTER — ephemeral, from /tmp)
+
+fleetctl was copied to `/tmp` with all paths redirected there, so nothing was
+written to flash at any point. Proven on hardware:
+
+- `health` — router platform detected, dbclient + `-K` found, conf parsed.
+- `discover` — read the controller's own nvram, `self` emitted for the
+  controller, node listed with its MAC pin.
+- `install` (via `extras/canary.sh`) — consent gate stated the plan and honoured
+  `--yes`, downloaded over HTTPS, ran as root through the local `self` path,
+  surfaced the installer's own health verdict per node, `1 ok`.
+- `install … uninstall` — argument pass-through, clean rollback.
+- `--dry-run` — resolved the target and printed the command, executed nothing.
+
+Six defects surfaced that 200+ offline tests never could, all fixed and now
+fixtures in the suite:
+
+1. A failed probe reported `unreachable: dbclient:` — dbclient's first stderr
+   line is bare, the message follows, and `head -1` threw it away.
+2. dbclient fell back to an **interactive password prompt** and waited; it
+   failed fast only because backgrounded children get `/dev/null` on stdin.
+   Fixed with `-o BatchMode=yes`, probed by name first.
+3. The discover table truncated the failure reason at its right edge — exactly
+   where the useful part lived.
+4. The wrap fix used `fold`, which is **absent** on this firmware, in a
+   `| fold | sed || fallback` chain that could not fail over (a pipeline's
+   status is the last stage's, and `sed` exits 0).
+5. `No auth methods could be used.` was misclassified as a network fault
+   because the matcher looked for `authentication`, not `auth methods`.
+6. The self-install guard matched `fleetctl` anywhere in the URL, so it blocked
+   `extras/canary.sh` — the installer built to be safe here — and would block
+   any addon in a similarly-named repo.
+
 ## Open questions
 
 Ordered by how much they affect real users.

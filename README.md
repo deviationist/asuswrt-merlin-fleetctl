@@ -605,11 +605,23 @@ are done with it; AiMesh propagates the removal to the nodes.
 
 ## Status
 
-v0.2.0. Exercised by 143 offline tests (`sh scripts/fleetctl.test.sh`, and
-again under `dash`) and validated against a dev mesh (RT-BE92U 3006 controller +
-stock RP-BE58 node): discovery parsing, key auth into a node, the eligibility
-skip path and the MAC-pin check are all confirmed on real hardware. The
-`install` happy path still needs a **Merlin** node to be validated in the field.
+v0.3.0. Exercised by 201 offline tests (`sh scripts/fleetctl.test.sh`, and again
+under `dash`), and **every verb has now run on a production router** — an
+RT-BE92U 3006 controller with a stock RP-BE58 node: `discover`, `nodes`, `run`,
+`install`, `install … uninstall`, `health`, the consent gate, the
+identity/pin/eligibility gates, `self` local execution and dry-run. The install
+cycle was proven with [`extras/canary.sh`](extras/canary.sh), which writes only
+to `/tmp`.
+
+Six defects came from that hardware which the test suite could not have found:
+a swallowed SSH error, an interactive password prompt that could hang a
+fan-out, a truncated failure reason, a missing `fold` applet (in a `||` chain
+that could not fail over), a misclassified auth error, and a self-install guard
+so broad it blocked its own canary.
+
+Still unproven: fan-out to a **second Merlin unit**. The only mesh available has
+one Merlin router and one stock node, so multi-node `install` remains field
+work.
 See `PLAN.md` for what is verified vs. still open, and `AGENTS.md` if you are
 contributing.
 
