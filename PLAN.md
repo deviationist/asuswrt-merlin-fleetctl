@@ -213,17 +213,52 @@ live controller and node — read-only)
   `/jffs/configs/profile.add` (removed on uninstall). Same fix should land in
   flowcache-doctor (its issue #3) so the ergonomics match.
 
+**2026-07-28** (deeper read-only probe, controller + node)
+
+- **`jffs2_scripts` is Merlin-only** — see Open questions #1, now answered.
+- **A stock node is far from inert**: `/jffs` exists (3.8 MB, mounted,
+  `jffs2_on=1`) and is **writable**, and the node ships `dbclient`, `curl`,
+  `wget`, `logger`, `cru`, `nvram`. What it lacks is Merlin's script hooks, not
+  storage or tooling — which is why `run`/`push` remain useful there and only
+  the `/jffs/scripts` verbs gate.
+- **A node knows the mesh too**: the node's own `cfg_device_list` is the same
+  83 bytes as the controller's, with `cfg_master=0` (controller: `1`). So
+  discovery could in principle run from a node; `FLEET_CONTROLLER` can point at
+  any unit that answers.
+- **Alternative discovery sources exist** for defensive fallback:
+  `cfg_relist` (MAC-only, no IPs), `cfg_recount` (plain node count, `1` here),
+  `cfg_re_maxnum` (16). `cfg_recount` is now quoted when the `cfg_device_list`
+  parse yields nothing — it turns "I found no mesh" into "the controller says
+  it has N nodes and I could not parse them", which is the difference between a
+  user shrugging and a user filing a useful bug.
+- **The default gateway IS the controller on this LAN** (`lan_ipaddr` =
+  192.168.x.1), which is the assumption controller auto-detection makes. It is
+  confirmed by probing, never assumed.
+- **macOS `tar` litters the router**: `/jffs/scripts` on the dev router already
+  contains `._roamctl`, `._roam-lib.sh`, `._roam-events.sh` — AppleDouble
+  sidecars from a BSD-tar deploy. The documented deploy line now sets
+  `COPYFILE_DISABLE=1`. fleetctl's own `push` is immune (it streams through
+  `cat`; there is no archive to carry metadata).
+- Controller JFFS headroom: 44.5 MB total, 40 MB free — fleetctl plus addons is
+  not a space concern.
+
 ## Open questions
 
 Ordered by how much they affect real users.
 
-1. **How does a user enable JFFS custom scripts on an AiMesh *node*?** The
-   gating precondition for installing any addon on a node, and a node has no
-   web UI of its own. Does `jffs2_scripts` sync from the controller the way
-   `sshd_authkeys` does, or must it be set per node over SSH? Field testers
-   have addons running on their nodes, so a path exists. **Until this is
-   answered, `install` is less useful than it looks** — the README says so
-   plainly rather than guessing.
+1. ~~How does a user enable JFFS custom scripts on an AiMesh node?~~
+   **ANSWERED 2026-07-28 — and the answer is "you don't".** `jffs2_scripts` is
+   a **Merlin-only** nvram variable: `nvram show | grep -c '^jffs2_scripts='`
+   returns 1 on the Merlin controller and **0** on the stock RP-BE58 node. It is
+   absent, not set to `0`. So an empty value means *not Merlin*, which no
+   setting can change — the unit needs Merlin flashed, and several AiMesh-only
+   models have no Merlin build at all. `jffs2_scripts=0` (Merlin, toggle off) is
+   the only case a GUI checkbox fixes. fleetctl now distinguishes the two and
+   says which one it hit; the old single message sent stock-node owners hunting
+   for a checkbox their firmware does not have. Consequence for the doctor:
+   mesh rollout onto a **stock** node is permanently impossible, not
+   "pending a setting" — testers with addons on nodes are using full Merlin
+   routers as nodes.
 2. **Does a node's `/jffs` survive AiMesh re-onboarding / re-sync?** If
    re-adding a node silently wipes the addon, "installed" is not a durable
    state and `nodes` should be able to detect the drift.

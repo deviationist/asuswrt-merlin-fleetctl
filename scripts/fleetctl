@@ -103,7 +103,7 @@ PORCELAIN=0
 # marks OUR line so a login banner can't be mistaken for the answer. An empty
 # model means "nvram did not answer" — i.e. not an ASUS unit at all, which is
 # a hard stop for anything mutating (see _require_target).
-PROBE='m=""; for v in lan_hwaddr label_mac et0macaddr et1macaddr; do x=$(nvram get $v 2>/dev/null); [ -n "$x" ] && m="$m$x,"; done; [ -d '"$FLEET_JFFS"' ] && d=yes || d=no; echo "__fleetprobe__ v=1 model=$(nvram get productid 2>/dev/null | tr " " "_") jffs=$(nvram get jffs2_scripts 2>/dev/null) dir=$d macs=$m"'
+PROBE='m=""; for v in lan_hwaddr label_mac et0macaddr et1macaddr; do x=$(nvram get $v 2>/dev/null); [ -n "$x" ] && m="$m$x,"; done; [ -d '"$FLEET_JFFS"' ] && d=yes || d=no; echo "__fleetprobe__ v=1 model=$(nvram get productid 2>/dev/null | tr " " "_") jffs=$(nvram get jffs2_scripts 2>/dev/null) dir=$d on=$(nvram get jffs2_on 2>/dev/null) macs=$m"'
 
 die()  { echo "ERROR: $1" >&2; exit 1; }
 warn() { echo "warn: $1" >&2; }
@@ -401,7 +401,7 @@ _target_desc() {
 # --- probe / identity -------------------------------------------------------
 # Sets: P_OK P_MODEL P_JFFS P_DIR P_MACS P_REASON
 _probe() {
-  P_OK=0; P_MODEL=""; P_JFFS=""; P_DIR=""; P_MACS=""; P_REASON=""
+  P_OK=0; P_MODEL=""; P_JFFS=""; P_DIR=""; P_ON=""; P_MACS=""; P_REASON=""
   # A per-node auth mismatch is that NODE's problem, not grounds to abort the
   # whole fan-out (continue-on-error: a half-run mesh with no record of where
   # it stopped is worse than a full run with failures listed).
@@ -428,9 +428,33 @@ _probe() {
   P_MODEL=$(echo "$_line" | tr ' ' '\n' | grep '^model=' | cut -d= -f2-)
   P_JFFS=$(echo  "$_line" | tr ' ' '\n' | grep '^jffs='  | cut -d= -f2-)
   P_DIR=$(echo   "$_line" | tr ' ' '\n' | grep '^dir='   | cut -d= -f2-)
+  P_ON=$(echo    "$_line" | tr ' ' '\n' | grep '^on='    | cut -d= -f2-)
   P_MACS=$(echo  "$_line" | tr ' ' '\n' | grep '^macs='  | cut -d= -f2- | tr 'a-z' 'A-Z')
   P_OK=1
   return 0
+}
+
+# Why a unit cannot take a /jffs-touching verb — and, crucially, whether the
+# user can do anything about it. VERIFIED 2026-07-28 on a stock RP-BE58 AiMesh
+# node vs the Merlin controller: `jffs2_scripts` is a MERLIN-ONLY nvram
+# variable. It is not set to 0 on stock firmware, it does not exist
+# (`nvram show | grep -c` returns 0, vs 1 on Merlin). So:
+#
+#   jffs empty -> stock ASUS firmware. There is no setting to enable; the unit
+#                 needs Merlin flashed, and for many AiMesh-only models no
+#                 Merlin build exists at all. Permanent, not a misconfiguration.
+#   jffs = 0   -> Merlin, custom scripts switched off. One GUI toggle away.
+#
+# Telling a stock-node owner to "enable JFFS custom scripts" sends them looking
+# for a checkbox their firmware does not have — which is what this used to do.
+_ineligible_reason() {
+  if [ -z "$P_JFFS" ]; then
+    echo "$P_MODEL is not running Asuswrt-Merlin (jffs2_scripts exists only on Merlin). Addons that install into /jffs/scripts need Merlin on that unit; several AiMesh-only models have no Merlin build, in which case this unit can never be an install target. 'run' still works on it"
+  elif [ "$P_JFFS" = "0" ]; then
+    echo "$P_MODEL runs Merlin but JFFS custom scripts are off — enable Administration -> System -> 'Enable JFFS custom scripts and configs' on that unit, then retry"
+  else
+    echo "$P_MODEL has jffs2_scripts=$P_JFFS but no $FLEET_JFFS directory (jffs2_on=${P_ON:-?})"
+  fi
 }
 
 # Eligibility gate for anything that touches a node's /jffs. Verified
@@ -563,7 +587,7 @@ _require_target() {
       # AiMesh node has no web UI of its own, so the honest instruction is the
       # one in the README, not a confident GUI path that does not exist.
       GATE=skip
-      GATE_REASON="not Merlin-eligible ($P_MODEL: jffs2_scripts=${P_JFFS:-empty}, /jffs/scripts=$P_DIR) — that unit needs Merlin firmware with JFFS custom scripts enabled; see README 'Enabling JFFS custom scripts on a node'"
+      GATE_REASON="not Merlin-eligible: $(_ineligible_reason)"
       return 1
     fi
   fi
@@ -729,6 +753,12 @@ $_recs
 EOF
   if [ -z "$cands" ]; then
     echo "fleetctl could not parse any node out of cfg_device_list."
+    # The controller also keeps a plain node COUNT. Quoting it turns "I got
+    # nothing" into "I should have found N" — the difference between a user
+    # thinking they have no mesh and knowing the parser is at fault.
+    _rc2=$(_run_on "$FLEET_PROBE_TIMEOUT" 'nvram get cfg_recount' 2>/dev/null | tr -dc '0-9')
+    [ -n "$_rc2" ] && [ "$_rc2" != "0" ] &&
+      echo "(the controller reports cfg_recount=$_rc2, so it believes it has $_rc2 node(s) — this is a parsing gap, please report the raw value below)"
     echo
     echo "raw value (unrecognised format — please report it):"
     echo "  $raw"
@@ -1044,7 +1074,7 @@ cmd_health() {
         elif _eligible; then
           ok "$SPEC_NAME ($P_MODEL): auth ok, Merlin-eligible$_p"
         else
-          note "$SPEC_NAME ($P_MODEL): auth ok, NOT Merlin-eligible$_p — 'run' works, 'install'/'push' will be skipped. See README 'Enabling JFFS custom scripts on a node'"
+          note "$SPEC_NAME: auth ok, NOT Merlin-eligible$_p — $(_ineligible_reason)"
         fi
         [ -z "$SPEC_MAC" ] && note "$SPEC_NAME: no mac= pin — 'install'/'push' will refuse it (re-run 'fleetctl discover' for a pinned line)"
       else

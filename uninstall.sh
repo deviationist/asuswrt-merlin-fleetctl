@@ -14,19 +14,30 @@
 #   - addons fleetctl installed on nodes. Roll those back FIRST, while fleetctl
 #     is still here:  fleetctl install <installer-url> uninstall
 
-DEST=/jffs/scripts
+# Same platform split as install.sh — `[ -d /jffs ]` plus an ASUS-only nvram
+# variable, never `which nvram` (macOS ships its own unrelated one). Without
+# this, running uninstall on a workstation looked in /jffs/scripts, found
+# nothing, and left the real install in place while reporting success.
+if [ -d /jffs ] && [ -n "$(nvram get productid 2>/dev/null)" ]; then
+  DEST=/jffs/scripts
+  CONFDIR=/jffs/scripts
+  PROFILE=/jffs/configs/profile.add
+else
+  DEST="${FLEETCTL_BIN:-$HOME/.local/bin}"
+  CONFDIR="${XDG_CONFIG_HOME:-$HOME/.config}/fleetctl"
+  PROFILE=""
+fi
 TOOL=$DEST/fleetctl
-PROFILE=/jffs/configs/profile.add
 
 if [ -x "$TOOL" ]; then
   "$TOOL" uninstall
 else
   echo "note: $TOOL not present — removing whatever artifacts remain."
-  rm -f "$DEST/fleetctl.conf" "$DEST/fleetctl.key" "$DEST/fleetctl.key.pub"
-  rm -rf "$DEST/fleetctl.d"
+  rm -f "$CONFDIR/fleetctl.conf" "$CONFDIR/fleetctl.key" "$CONFDIR/fleetctl.key.pub"
+  rm -rf "$CONFDIR/fleetctl.d"
 fi
 
-[ -f "$PROFILE" ] && sed -i '/# fleetctl PATH/d' "$PROFILE"
+[ -n "$PROFILE" ] && [ -f "$PROFILE" ] && sed -i '/# fleetctl PATH/d' "$PROFILE"
 rm -f "$TOOL" /tmp/fleetctl.update.sh
 rm -rf /tmp/fleetctl.lock
 

@@ -207,6 +207,16 @@ public:
   **degrade, never hard-fail**: firmware generations differ within one mesh
   (3004 nodes under a 3006 controller are in the field), so an unrecognised
   `cfg_device_list` prints the raw value and hands over to manual config.
+- **`jffs2_scripts` is a MERLIN-ONLY nvram variable — absent, not `0`, on stock
+  firmware.** Verified 2026-07-28: `nvram show | grep -c '^jffs2_scripts='`
+  returns 1 on the Merlin controller and **0** on the stock RP-BE58 node. So an
+  empty value means "not Merlin" (needs a firmware flash, and several
+  AiMesh-only models have no Merlin build at all — permanent), while `0` means
+  "Merlin, setting off" (one GUI toggle). `_ineligible_reason()` must keep
+  telling those apart: the old single message sent stock-node owners hunting
+  for a checkbox their firmware does not have. Note the node's `/jffs` is
+  present, mounted (`jffs2_on=1`) and writable, and it has `curl`/`wget`/`cru`
+  — what is missing is Merlin's script hooks, not storage.
 - **The eligibility gate is only for `/jffs`-touching verbs.** A stock
   (non-Merlin) AiMesh node is a legitimate `run` target — it still answers
   `nvram get`, `wl`, etc. Verified signature: a stock node returns an empty
@@ -251,8 +261,13 @@ public:
   authenticating with a dropbear-format key, AiMesh really syncing
   `sshd_authkeys`, real `cfg_device_list` values on other firmware generations —
   is validated live over SSH.
-- Live deploy from a checkout (operator-run):
-  `tar cf - -C scripts fleetctl | ssh <router> 'tar xf - -C /jffs/scripts && chmod 755 /jffs/scripts/fleetctl && /jffs/scripts/fleetctl health'`
+- Live deploy from a checkout (operator-run). **`COPYFILE_DISABLE=1` is not
+  optional on macOS**: BSD tar otherwise packs an AppleDouble `._name` sidecar
+  for every file, and they land on the router's flash. The dev router already
+  has `._roamctl`, `._roam-lib.sh`, `._roam-events.sh` in `/jffs/scripts` from
+  exactly this mistake (observed 2026-07-28). fleetctl's own `push` is immune —
+  it streams through `cat`, so there is no archive to carry metadata.
+  `COPYFILE_DISABLE=1 tar cf - -C scripts fleetctl | ssh <router> 'tar xf - -C /jffs/scripts && chmod 755 /jffs/scripts/fleetctl && /jffs/scripts/fleetctl health'`
 
 ## Architecture in one paragraph
 

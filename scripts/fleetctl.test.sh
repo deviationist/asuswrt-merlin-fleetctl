@@ -68,7 +68,7 @@ done
 host=${target#*@}
 f="$FLEET_TEST_DIR/hosts/$host"
 [ -f "$f" ] || { echo "ssh: Connection to $host failed: No route to host" >&2; exit 255; }
-auth=ok; model=""; jffs=""; dir=no; macs=""; rc=0; sleepsec=0
+auth=ok; model=""; jffs=""; dir=no; on=1; macs=""; rc=0; sleepsec=0
 . "$f"
 [ "$sleepsec" != "0" ] && sleep "$sleepsec"
 case "$auth" in
@@ -77,7 +77,7 @@ case "$auth" in
   *) echo "dbclient: Authentication failed" >&2; exit 255 ;;
 esac
 case "$cmd" in
-  *__fleetprobe__*) echo "__fleetprobe__ v=1 model=$model jffs=$jffs dir=$dir macs=$macs"; exit 0 ;;
+  *__fleetprobe__*) echo "__fleetprobe__ v=1 model=$model jffs=$jffs dir=$dir on=${on:-1} macs=$macs"; exit 0 ;;
   *cfg_device_list*) cat "$FLEET_TEST_DIR/cfg_device_list"; exit 0 ;;
   *"cat > "*)       cat > "$FLEET_TEST_DIR/pushed-$host"; exit "$rc" ;;
   *"curl -fsSL"*)   printf '%s\n' "$cmd" >> "$FLEET_TEST_DIR/installcmd-$host"
@@ -485,6 +485,29 @@ has  "lib mode: fleet_version reports the script version" "$out" "$VER"
 env_out=$(FLEETCTL_LIB=1 "$SH" "$FLEETCTL" run 'echo SHOULD-NOT-RUN' 2>&1)
 hasnt "lib mode: loading never executes a verb" "$env_out" "SHOULD-NOT-RUN"
 
+# === eligibility diagnosis ==================================================
+echo "-- eligibility diagnosis"
+# jffs2_scripts is MERLIN-ONLY: absent on stock firmware, not "0". The two cases
+# need different advice — one is a firmware flash, the other is a GUI toggle.
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.3,mac=AA:BB:CC:DD:EE:03"'
+out=$(run install https://example.invalid/addon.sh 2>&1)
+has  "stock node: diagnosed as not-Merlin"     "$out" "is not running Asuswrt-Merlin"
+has  "stock node: warns a build may not exist" "$out" "no Merlin build"
+hasnt "stock node: does NOT suggest a GUI toggle it lacks" "$out" "Enable JFFS custom scripts and configs"
+
+# Merlin with the setting off -> that IS the GUI toggle case
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.3,mac=AA:BB:CC:DD:EE:03"'
+host_fixture 192.168.1.3 ok RT-NODE-C 0 no "AA:BB:CC:DD:EE:03," 0 0
+out=$(run install https://example.invalid/addon.sh 2>&1)
+has  "scripts-off node: points at the GUI toggle" "$out" "Enable JFFS custom scripts and configs"
+hasnt "scripts-off node: not called non-Merlin" "$out" "is not running Asuswrt-Merlin"
+
+# Merlin, scripts on, but the directory is missing -> a third, distinct case
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.3,mac=AA:BB:CC:DD:EE:03"'
+host_fixture 192.168.1.3 ok RT-NODE-D 1 no "AA:BB:CC:DD:EE:03," 0 0
+out=$(run install https://example.invalid/addon.sh 2>&1)
+has  "no-scripts-dir node: reported distinctly" "$out" "but no"
+
 # === single-device / passthrough ============================================
 echo "-- single device"
 # A fleet of one is the common case for a consuming addon's user. On a router,
@@ -584,7 +607,7 @@ has  "health: warns about a missing pin"      "$out" "no mac= pin"
 
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.3,mac=AA:BB:CC:DD:EE:03"'
 out=$(run health 2>&1)
-has  "health: ineligible node gets remediation" "$out" "Enabling JFFS custom scripts on a node"
+has  "health: ineligible node gets an actionable reason" "$out" "is not running Asuswrt-Merlin"
 
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.4"'
 out=$(run health 2>&1); rc=$?

@@ -465,14 +465,26 @@ scripts enabled (`nvram get jffs2_scripts` = 1 **and** `/jffs/scripts` present).
 A stock AiMesh node returns an empty `jffs2_scripts` and is skipped with that
 reason — it remains a perfectly good `run` target.
 
-**This is the one prerequisite we cannot yet give a verified recipe for.** An
-AiMesh node has no web UI of its own, so the controller's *Administration →
-System* page is not a path to the node's setting, and we have not yet confirmed
-whether `jffs2_scripts` propagates from the controller the way `sshd_authkeys`
-does, or must be set per node over SSH. Field testers do have addons running on
-their nodes, so a path exists — it is [open question #1](CONSUMER-BRIEF.md) and
-will be documented here once verified rather than guessed at. Until then,
-`fleetctl run` works on every node regardless.
+**Answered 2026-07-28, and the answer is not "flip a setting".**
+`jffs2_scripts` is a **Merlin-only** nvram variable: on the Merlin controller
+`nvram show | grep -c '^jffs2_scripts='` returns 1, on the stock RP-BE58 node it
+returns **0** — the variable does not exist, rather than being set to `0`. So:
+
+| What fleetctl sees | What it means | What you can do |
+|---|---|---|
+| `jffs2_scripts` empty | the unit is **not running Merlin** | flash Merlin on that unit — and several AiMesh-only models have no Merlin build, in which case it can never be an install target |
+| `jffs2_scripts=0` | Merlin, custom scripts switched off | enable *Administration → System → "Enable JFFS custom scripts and configs"* on that unit |
+| `jffs2_scripts=1` + `/jffs/scripts` | eligible | — |
+
+fleetctl reports which of these it is, so the skip reason is actionable instead
+of a dead end. Worth knowing: a stock node's `/jffs` **is** present, mounted and
+writable, and it ships `curl`, `wget` and `cru` — what is missing is Merlin's
+script hooks, not storage. And `fleetctl run` works on every node regardless,
+which is why the eligibility gate deliberately does not apply to it.
+
+Field testers who have addons running on their nodes therefore have
+Merlin-capable nodes (a full router used as a node), not stock AiMesh
+extenders.
 
 ## Troubleshooting
 
