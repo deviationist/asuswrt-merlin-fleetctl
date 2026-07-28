@@ -14,29 +14,42 @@
 # Uninstall:  sh install.sh uninstall
 
 REPO_RAW="https://raw.githubusercontent.com/deviationist/asuswrt-merlin-fleetctl/main"
-DEST=/jffs/scripts
-TOOL=$DEST/fleetctl
-CONF=$DEST/fleetctl.conf
-HOMEDIR=$DEST/fleetctl.d
-PROFILE=/jffs/configs/profile.add
 
 fail() { echo "ERROR: $1" >&2; exit 1; }
 
-[ -d /jffs ] || fail "no /jffs mount — is this an Asuswrt-Merlin router?"
-[ "$(nvram get jffs2_scripts)" = "1" ] || fail "JFFS custom scripts are disabled.
+# fleetctl runs on the router AND on a workstation, so the installer has to
+# know which one it is looking at. Detection is `[ -d /jffs ]` + an ASUS-only
+# nvram variable, NOT `which nvram`: macOS ships its own unrelated
+# /usr/sbin/nvram and would otherwise be mistaken for a router.
+if [ -d /jffs ] && [ -n "$(nvram get productid 2>/dev/null)" ]; then
+  PLATFORM=router
+  DEST=/jffs/scripts
+  CONFDIR=/jffs/scripts
+  PROFILE=/jffs/configs/profile.add
+  [ "$(nvram get jffs2_scripts)" = "1" ] || fail "JFFS custom scripts are disabled.
 Enable: Administration -> System -> 'Enable JFFS custom scripts and configs' = Yes,
 hit Apply, then re-run this installer."
+else
+  PLATFORM=workstation
+  DEST="${FLEETCTL_BIN:-$HOME/.local/bin}"
+  CONFDIR="${XDG_CONFIG_HOME:-$HOME/.config}/fleetctl"
+  PROFILE=""
+  command -v sh >/dev/null 2>&1 || fail "no POSIX shell?"
+fi
+TOOL=$DEST/fleetctl
+CONF=$CONFDIR/fleetctl.conf
+HOMEDIR=$CONFDIR/fleetctl.d
 
 if [ "$1" = "uninstall" ]; then
   [ -x "$TOOL" ] && "$TOOL" uninstall
-  [ -f "$PROFILE" ] && sed -i '/# fleetctl PATH/d' "$PROFILE"
-  rm -f "$TOOL" "$CONF" "$DEST/fleetctl.key" "$DEST/fleetctl.key.pub" /tmp/fleetctl.update.sh
+  [ -n "$PROFILE" ] && [ -f "$PROFILE" ] && sed -i '/# fleetctl PATH/d' "$PROFILE"
+  rm -f "$TOOL" "$CONF" "$CONFDIR/fleetctl.key" "$CONFDIR/fleetctl.key.pub" /tmp/fleetctl.update.sh
   rm -rf "$HOMEDIR" /tmp/fleetctl.lock
   echo "fleetctl uninstalled."
   exit 0
 fi
 
-mkdir -p "$DEST"
+mkdir -p "$DEST" "$CONFDIR"
 
 # Fetch the tool (prefer a local copy when run from a checkout).
 # NOTE: this never writes over a RUNNING fleetctl in place from fleetctl's own
@@ -107,32 +120,58 @@ fi
 # /jffs/scripts is not on PATH, so `fleetctl` alone would not resolve. Merlin
 # sources /jffs/configs/profile.add for interactive shells; one guarded line
 # there is the least invasive fix, and uninstall removes it.
-if [ "$1" != "--no-path" ]; then
+if [ "$PLATFORM" = "router" ] && [ "$1" != "--no-path" ]; then
   mkdir -p /jffs/configs
   [ -f "$PROFILE" ] || : > "$PROFILE"
   grep -q '# fleetctl PATH' "$PROFILE" 2>/dev/null ||
     echo 'export PATH="$PATH:/jffs/scripts"   # fleetctl PATH' >> "$PROFILE"
 fi
 
-echo "fleetctl installed at $TOOL"
+echo "fleetctl installed at $TOOL ($PLATFORM)"
 echo
 
-# Generate the keypair and print it: 'setup' only creates files in fleetctl's
-# own path and prints the pubkey — it writes no nvram, so it is safe to run
-# unattended as part of an install. The one action that could lock someone out
-# (authorizing the key) stays a human step in the GUI.
-"$TOOL" setup
+# Deliberately does NOT generate a key. Credential material is the operator's
+# to create and authorize; fleetctl only ever REFERENCES what the config names
+# (see README, "What fleetctl does not touch"). Installing a tool should not
+# silently mint a private key on someone's system — so `keygen` stays an
+# explicit, optional command.
+if [ "$PLATFORM" = "router" ]; then
+  cat <<EOF
+Next:
 
-cat <<EOF
+  1. Get an SSH key onto the mesh. If you do not already have one:
+         fleetctl keygen              # writes only into $CONFDIR, authorizes nothing
+     Then paste the printed public key into the router GUI
+     (Administration -> System -> "SSH Authentication key") and Apply.
+     AiMesh syncs that field to every node, so this is the only per-mesh step.
+     Already have a key you use for the router? Just point FLEET_KEY at it.
 
-After pasting the key and applying:
-
-  fleetctl discover                 # nodes + a conf-ready FLEET_NODES line
-  fleetctl nodes                    # verify auth + eligibility per node
-  fleetctl --dry-run run 'uptime'   # confirm the target list before trusting it
-  fleetctl health                   # self-check
+  2. fleetctl discover                 # nodes + a conf-ready FLEET_NODES line
+  3. fleetctl nodes                    # verify auth + eligibility per node
+  4. fleetctl --dry-run run 'uptime'   # confirm the target list before trusting it
+  5. fleetctl health                   # self-check
 
 (Open a new SSH session, or run '. $PROFILE', to get 'fleetctl' on your PATH.)
-
-Uninstall:  sh install.sh uninstall    (or: fleetctl uninstall)
 EOF
+else
+  cat <<EOF
+Next:
+
+  1. Point fleetctl at your mesh in $CONF:
+         FLEET_CONTROLLER="192.168.1.1"   # or a Host alias from ~/.ssh/config
+     If your ~/.ssh already reaches the router (agent, or a Host block), there
+     is nothing else to set up — leave FLEET_KEY unset and OpenSSH decides.
+     Otherwise: fleetctl keygen, then paste the public key into the router GUI
+     (Administration -> System -> "SSH Authentication key").
+
+  2. fleetctl discover                 # nodes + a conf-ready FLEET_NODES line
+  3. fleetctl nodes                    # verify auth + eligibility per node
+  4. fleetctl --dry-run run 'uptime'   # confirm the target list before trusting it
+
+EOF
+  case ":$PATH:" in
+    *":$DEST:"*) : ;;
+    *) echo "note: $DEST is not on your PATH — add it, or call $TOOL directly."; echo ;;
+  esac
+fi
+echo "Uninstall:  sh install.sh uninstall    (or: fleetctl uninstall)"

@@ -26,6 +26,66 @@ silently half-installed, the user has no way to notice. So:
   print `Installed and HEALING`). Swallowing that output turns one silent
   misconfiguration into N invisible ones, all self-reporting success.
 
+## The credentials boundary (added 0.2, at the owner's direction)
+
+fleetctl **consumes** credentials; it never provisions them. Provisioning is
+outside this tool's business, and keeping it outside is what makes the security
+story auditable. So fleetctl must never:
+
+- write `sshd_authkeys`, or any nvram variable, anywhere;
+- add a public key to any `authorized_keys` file;
+- store a password (the opt-in prompt is process-memory only, never disk);
+- read credentials from anywhere but the config the operator wrote.
+
+`keygen` is the sole command that creates key material. It writes only into
+fleetctl's own directory, prints the public half, authorizes nothing, and is
+**never invoked for the user** — not by the installer, not by another verb.
+(The installer used to run it automatically; that was removed, because
+installing a tool should not silently mint a private key on someone's system.)
+If you are tempted to add "helpfully install the key for them", don't: that is
+the one action that can lock a user out of their own mesh.
+
+## Two platforms, one tool
+
+fleetctl runs on the router AND on a workstation. Detection is `[ -d /jffs ]`
+plus an ASUS-only nvram variable — **never `which nvram`**, because macOS ships
+its own unrelated `/usr/sbin/nvram` and every Mac would be misread as a router.
+`FLEETCTL_PLATFORM` forces the branch so the suite can cover both.
+
+What differs, and must stay differing:
+
+- **Config location**: `/jffs/scripts` vs `${XDG_CONFIG_HOME:-~/.config}/fleetctl`.
+- **known_hosts**: the router gets fleetctl's own store (HOME repointed). A
+  workstation must NOT have HOME repointed — that would hide the operator's
+  `~/.ssh/config`, agent and keys, which is exactly what makes
+  `FLEET_NODES="router"` work there with no config at all.
+- **Empty `FLEET_USER` is meaningful off-router**: connect as a bare host and
+  let `~/.ssh/config` decide. Do not "fix" it by defaulting to `admin`.
+- **A missing key is a FAIL on the router, a note on a workstation** (OpenSSH
+  may authenticate from an agent).
+
+`self` (alias `local`) is a node spec meaning *this machine, executed directly*.
+Being listed is the opt-in, so it bypasses the `--include-self` guard (which
+covers the different case of a node ADDRESS resolving to the controller) and
+needs no `mac=` pin (a pin defends against address indirection; there is none).
+It is refused for mutating verbs when the machine is not an ASUS unit — via the
+ordinary identity gate, not a special case. `install` of fleetctl's own
+installer onto a local target is refused outright: that rewrites the running
+script.
+
+## Public contracts (breaking these breaks consumers)
+
+fleetctl is meant to be **depended on, not vendored** — addons like
+flowcache-doctor call it rather than copying it. Two surfaces are therefore
+public:
+
+- **`--porcelain`**: `fleetctl<TAB>node<TAB>OK|FAIL|SKIPPED<TAB>reason`, one row
+  per node. Never reorder or repurpose a column; append if you must add one.
+- **Library mode**: `FLEETCTL_LIB=1 . fleetctl` loads without running a verb and
+  exposes `fleet_version`, `fleet_platform`, `fleet_list`, `fleet_spec`,
+  `fleet_probe`, `fleet_eligible`, `fleet_gate`, `fleet_exec`. Those names are
+  stable; the `_underscore` internals they wrap are not.
+
 ## Hard constraints (busybox / router — each one is an observed failure)
 
 - **busybox `sh` only.** No bash, no arrays, no `[[`, no process substitution.
@@ -41,6 +101,16 @@ silently half-installed, the user has no way to notice. So:
   silently sent nothing and wrote an **empty file over the destination**, exit
   0. That is why `_with_timeout` redirects from `$RUN_STDIN` explicitly. Do not
   "simplify" it away; there is a test.
+- **A background child inherits the parent's stdout, and `$( … )` waits for
+  EVERY writer to close that pipe.** The timeout watchdog backgrounds a sleeper;
+  without `>/dev/null 2>&1` on it, `raw=$(_run_on …)` (how discovery reads the
+  device list) blocks for the FULL timeout even after the call succeeded — a 20 s
+  stall on every `discover`. Found by running the suite under dash.
+- **`VAR=x some_function` does NOT scope the assignment.** POSIX leaves
+  assignments preceding a *function* call set in the shell afterwards. It only
+  scopes for external commands. This bit both the script (hence HOME is exported
+  deliberately, not prefixed) and the test harness (hence `runp`, which prefixes
+  an external command).
 - **There is no `command` builtin.** `command -v foo` fails with
   `command: not found` — a false negative that reads as "foo is missing". Probe
   with `which`.
@@ -137,14 +207,16 @@ silently half-installed, the user has no way to notice. So:
 ## Testing
 
 - Syntax: `for f in install.sh uninstall.sh scripts/*; do sh -n "$f" && dash -n "$f"; done`
-- Logic: `sh scripts/fleetctl.test.sh` — 101 black-box tests, no router needed.
+- Logic: `sh scripts/fleetctl.test.sh` — 143 black-box tests, no router needed.
   Also run `SH=dash sh scripts/fleetctl.test.sh`. All must pass.
   The suite mocks `nvram` / `dbclient` / `dropbearkey` / `logger` with per-host
   fixture files (`auth`, `model`, `jffs`, `dir`, `macs`, `rc`, `sleepsec`), so a
   node can be made unreachable, unauthenticated, stock, slow, or failing. Env
   seams: `FLEETCTL_CONF`, `FLEETCTL_HOME`, `FLEETCTL_LOCK`, `NVRAM_STATE`.
-- **Add a test with every behaviour change.** The suite already caught two real
-  bugs (the async-stdin `push` truncation; a lock that never held). Fan-out
+- **Add a test with every behaviour change.** The suite has already caught three
+  real bugs (the async-stdin `push` truncation; a lock that never held; the
+  watchdog holding a command-substitution pipe open for its whole duration —
+  that last one only under `dash`, which is why both shells are run). Fan-out
   safety claims that are not tested are just comments.
 - There is no CI and no router emulator. The router half — dbclient really
   authenticating with a dropbear-format key, AiMesh really syncing

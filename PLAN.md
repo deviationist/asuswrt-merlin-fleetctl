@@ -1,7 +1,8 @@
 # asuswrt-merlin-fleetctl — plan
 
 Agnostic AiMesh fleet orchestration for Asuswrt-Merlin: run commands, push
-files, and roll out any addon across a mesh from the main router, over SSH.
+files, and roll out any addon across a mesh over SSH — from the main router
+itself or from a workstation.
 Extracted from flowcache-doctor's fleet-mode design (its issue #6 archives the
 original field data); follows the `asuswrt-merlin-accessctl` pattern —
 general capability, own repo, addon-independent.
@@ -31,10 +32,12 @@ writes `sshd_authkeys` or any security-relevant nvram.
 
 One-time user setup:
 
-1. `fleetctl setup` generates a dedicated client keypair on the router
-   (file creation only, fleetctl's own path — NOT `/jffs/.ssh/`, which
-   holds firmware-managed sshd host keys) and **prints** the pubkey with
-   paste instructions.
+1. The user needs a key that reaches the router. `fleetctl keygen` will make
+   one (file creation only, in fleetctl's own path — NOT `/jffs/.ssh/`, which
+   holds firmware-managed sshd host keys) and **print** the pubkey with paste
+   instructions — but it is optional and **never run automatically**: point
+   `FLEET_KEY` at an existing key, or on a workstation let `~/.ssh` do it.
+   See *0.2 decisions* below on the credentials boundary.
 2. The user pastes the pubkey into the router GUI's SSH authorized-keys
    field (Administration → System). **AiMesh syncs that field byte-for-byte
    to every node** (verified live 2026-07-22 on RT-BE92U + RP-BE58:
@@ -63,7 +66,8 @@ hang).
 
 Single busybox-sh script + conf, mirroring the doctor's conventions:
 
-- `/jffs/scripts/fleetctl` — the tool
+- `/jffs/scripts/fleetctl` — the tool (workstation: `~/.local/bin/fleetctl`,
+  config under `~/.config/fleetctl/`)
 - `/jffs/scripts/fleetctl.conf` — user config (created by installer with
   commented defaults; never overwritten)
 - `/jffs/scripts/fleetctl.key` (+ `.pub`) — the client keypair
@@ -94,12 +98,12 @@ root shells must aim at a stable, user-owned target list. Discovery is a
 suggestion generator that emits **pinned** specs, so the safe path is the
 default one.
 
-### Verbs (v0.1 — all built)
+### Verbs (all built)
 
 | Verb | Action | Writes? |
 |---|---|---|
 | `discover` | parse `cfg_device_list` nvram → candidate nodes; test SSH auth + Merlin eligibility per node; print conf-ready pinned specs | no |
-| `setup` | generate keypair (if absent), print pubkey + GUI paste instructions | key files only |
+| `keygen` | create a keypair (if absent), print pubkey + GUI paste instructions. Optional, never auto-run | key files only |
 | `nodes` | list configured nodes with reachability/auth/pin/eligibility status | no |
 | `run <cmd>` | execute on every node, output prefixed `[node]` | whatever cmd does |
 | `push <file> <dest>` | `cat`-stream fan-out, atomic temp+mv | remote file |
@@ -109,7 +113,7 @@ default one.
 | `uninstall` | remove fleetctl from this router | removes own files |
 
 Global flags (before the verb): `--dry-run`, `--nodes`, `--include-self`,
-`--allow-unpinned`.
+`--allow-unpinned`, `--porcelain`.
 
 ### Fan-out safety (from `CONSUMER-BRIEF.md` §3 — all implemented)
 
@@ -252,12 +256,58 @@ every applet AND every dbclient flag, never `ps | grep` for processes, never
 overwrite a running script, JFFS is flash, `cru` for cron, dev-router mutations
 are operator-run.
 
+## 0.2 decisions (2026-07-28)
+
+Three owner questions reshaped the tool after v0.1 was pushed:
+
+- **"Which host do we run on?"** → **both**. Platform is detected by
+  `[ -d /jffs ]` + an ASUS-only nvram variable (never `which nvram` — macOS
+  ships its own `/usr/sbin/nvram` and every Mac would be misread as a router).
+  Off-router, config moves to `~/.config/fleetctl/`, `FLEET_USER` defaults to
+  EMPTY so `~/.ssh/config` supplies user/port/key, and HOME is NOT repointed
+  (doing so would hide the operator's agent and Host blocks). Discovery asks
+  `FLEET_CONTROLLER` over SSH instead of reading local nvram.
+- **"The config should be able to flag an item as self."** → the `self` spec
+  (alias `local`) executes directly, no SSH hop, so a unit needs no key
+  authorized against itself. Listing it IS the opt-in, so it is exempt from
+  `--include-self` and from the `mac=` requirement (a pin defends against
+  address indirection; local has no address). On a workstation it fails the
+  mutating verbs through the ordinary identity gate — your laptop is not an
+  ASUS unit — with no special-casing. `discover` emits `self` for the
+  controller when run there, a pinned spec when run from a workstation.
+- **"Should it manage keys/passwords on the system?"** → **no**, and the
+  installer was violating that: it ran `setup` automatically, minting a private
+  key just because you installed the tool. Removed. `setup` is renamed
+  **`keygen`** (honest about what it does), is never invoked for the user, and
+  writes only into fleetctl's own directory. See README, *What fleetctl does
+  not touch*. fleetctl consumes credentials named in the config; provisioning
+  them is outside the tool.
+- **"Can the doctor depend on it?"** → yes, via the **CLI contract**, not
+  vendoring (copying the fan-out code into each addon is the problem this repo
+  exists to solve). Two public surfaces: `--porcelain`
+  (`fleetctl<TAB>node<TAB>OK|FAIL|SKIPPED<TAB>reason`, columns never reordered)
+  and library mode (`FLEETCTL_LIB=1 . fleetctl` exposing stable `fleet_*`
+  functions). Prefer the CLI — it is version-tolerant and keeps the safety
+  model on your side of the call.
+
+Two more real bugs fell out of this work, both silent-success class and both
+caught by the suite: a background child inherits the parent's stdout, so the
+timeout watchdog held every `$( … )` capture open for its full duration (a 20 s
+stall on every `discover` — visible only under `dash`); and `VAR=x func` does
+not scope the assignment in POSIX sh, which would have leaked a forced platform
+across the whole test run.
+
 ## Milestones
 
-- **v0.1** (built, offline-tested): `setup` / `discover` / `nodes` / `run` /
-  `push` / `install` / `health` / `update` / `uninstall`, with the full
-  fan-out safety model. Pending: live validation on the dev mesh, then the
-  `install` happy path in the field.
+- **v0.1** (done): `discover` / `nodes` / `run` / `push` / `install` / `health`
+  / `update` / `uninstall`, with the full fan-out safety model. Discovery
+  parsing, node key-auth, the eligibility skip path and the MAC-pin check are
+  confirmed on real hardware.
+- **v0.2** (built, offline-tested — 143 tests under two shells): runs on a
+  workstation as well as the router, `self` targets, `keygen` rename + the
+  credentials boundary, `--porcelain` and library mode for consuming addons.
+  Pending: live validation of the workstation path, then the `install` happy
+  path in the field.
 - **v0.2**: whatever the dev-mesh and field runs teach us — plus open
   questions 1–2, which may add a `nodes` drift check.
 - **v0.3**: docs + SNBForums announcement; doctor README integration

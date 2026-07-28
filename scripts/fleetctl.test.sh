@@ -29,6 +29,11 @@ BIN="$TMP/bin"; mkdir -p "$BIN" "$TMP/hosts"
 export NVRAM_STATE="$TMP/nvram"
 export FLEET_TEST_DIR="$TMP"
 export FLEETCTL_CONF="$TMP/conf" FLEETCTL_HOME="$TMP/home" FLEETCTL_LOCK="$TMP/lock"
+# The probed /jffs path, redirected so a `self` target can be made to look
+# eligible (or not) on the test machine. The suite runs as PLATFORM=workstation
+# — there is no /jffs on a Mac or a CI box — which is itself worth knowing: the
+# off-router paths are the ones exercised by default here.
+export FLEETCTL_JFFS="$TMP/jffs"
 export PATH="$BIN:$PATH"
 
 # --- mock router commands ---------------------------------------------------
@@ -73,6 +78,7 @@ case "$auth" in
 esac
 case "$cmd" in
   *__fleetprobe__*) echo "__fleetprobe__ v=1 model=$model jffs=$jffs dir=$dir macs=$macs"; exit 0 ;;
+  *cfg_device_list*) cat "$FLEET_TEST_DIR/cfg_device_list"; exit 0 ;;
   *"cat > "*)       cat > "$FLEET_TEST_DIR/pushed-$host"; exit "$rc" ;;
   *"curl -fsSL"*)   printf '%s\n' "$cmd" >> "$FLEET_TEST_DIR/installcmd-$host"
                     echo "roam-detect installed"; echo "Installed and HEALING"; exit "$rc" ;;
@@ -97,6 +103,15 @@ fi
 echo "MOCK-PRIVATE-KEY" > "$f"
 M
 printf '#!/bin/sh\nexit 0\n' > "$BIN/logger"
+# mock curl: only reached by a LOCAL (`self`) install, where the download runs
+# on this machine. Writes a stand-in addon installer to the -o path.
+cat > "$BIN/curl" <<'M'
+#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift 2 ;; *) shift ;; esac; done
+[ -n "$out" ] || exit 1
+printf '#!/bin/sh\necho "addon installed on $(hostname 2>/dev/null || echo host)"\necho "Installed and HEALING"\nexit 0\n' > "$out"
+M
 chmod +x "$BIN"/*
 
 # --- fixtures ---------------------------------------------------------------
@@ -111,13 +126,16 @@ rc=$7
 sleepsec=$8
 EOF
 }
+CDL='<controller>192.168.1.1>AA:BB:CC:DD:EE:01>1<node1>192.168.1.2>AA:BB:CC:DD:EE:02>0<node2>192.168.1.3>AA:BB:CC:DD:EE:03>0'
 reset() {
   printf '%s\n' \
     'http_username=admin' 'sshd_port=22' 'jffs2_scripts=1' \
     'productid=RT-PLACEHOLDER' 'lan_ipaddr=192.168.1.1' 'lan_hwaddr=AA:BB:CC:DD:EE:01' \
     'label_mac=AA:BB:CC:DD:EE:01' \
-    'cfg_device_list=<controller>192.168.1.1>AA:BB:CC:DD:EE:01>1<node1>192.168.1.2>AA:BB:CC:DD:EE:02>0<node2>192.168.1.3>AA:BB:CC:DD:EE:03>0' \
+    "cfg_device_list=$CDL" \
     > "$NVRAM_STATE"
+  printf '%s\n' "$CDL" > "$TMP/cfg_device_list"   # what a remote controller returns
+  mkdir -p "$TMP/jffs"                            # `self` looks Merlin-eligible
   rm -rf "$TMP/hosts" "$TMP/home" "$TMP/lock" "$TMP/sshlog" "$TMP"/pushed-* "$TMP"/installcmd-*
   rm -f "$TMP/fleetctl.key" "$TMP/fleetctl.key.pub"   # tests opt in via withkey
   mkdir -p "$TMP/hosts"
@@ -136,6 +154,10 @@ withkey() { echo "MOCK-PRIVATE-KEY" > "$KEY"; chmod 600 "$KEY"; }
 # --- harness ----------------------------------------------------------------
 PASS=0; FAIL=0
 run() { "$SH" "$FLEETCTL" "$@"; }
+# Platform-forced variant. NOT `FLEETCTL_PLATFORM=x run …`: a var assignment
+# preceding a FUNCTION call persists in the shell under POSIX rules, so it
+# would leak into every later test. Prefixing an external command is scoped.
+runp() { _p=$1; shift; FLEETCTL_PLATFORM="$_p" "$SH" "$FLEETCTL" "$@"; }
 has()   { case "$2" in *"$3"*) PASS=$((PASS+1)); printf '  ok   %s\n' "$1";; *) FAIL=$((FAIL+1)); printf '  FAIL %s\n       got: %s\n' "$1" "$(echo "$2" | tr '\n' '|' | cut -c1-300)";; esac; }
 hasnt() { case "$2" in *"$3"*) FAIL=$((FAIL+1)); printf '  FAIL %s\n       unexpectedly got: %s\n' "$1" "$(echo "$2" | tr '\n' '|' | cut -c1-300)";; *) PASS=$((PASS+1)); printf '  ok   %s\n' "$1";; esac; }
 is()    { if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; else FAIL=$((FAIL+1)); printf '  FAIL %s | got "%s" want "%s"\n' "$1" "$2" "$3"; fi; }
@@ -144,47 +166,120 @@ nonzero(){ if [ "$2" != "0" ]; then PASS=$((PASS+1)); printf '  ok   %s\n' "$1";
 echo "fleetctl tests ($SH):"
 
 # === setup ==================================================================
-echo "-- setup"
+echo "-- keygen"
 reset; conf "FLEET_KEY=\"$KEY\""
-out=$(run setup 2>&1)
-has  "setup: prints the pubkey line"          "$out" "ssh-ed25519 AAAA"
-is   "setup: key file created"                "$([ -f "$KEY" ] && echo y)" "y"
-has  "setup: tells the user where to paste"   "$out" "SSH Authentication key"
-has  "setup: says AiMesh syncs it"            "$out" "AiMesh syncs that field"
+out=$(run keygen 2>&1)
+has  "keygen: prints the pubkey line"          "$out" "ssh-ed25519 AAAA"
+is   "keygen: key file created"                "$([ -f "$KEY" ] && echo y)" "y"
+has  "keygen: tells the user where to paste"   "$out" "SSH Authentication key"
+has  "keygen: says AiMesh syncs it"            "$out" "AiMesh syncs that field"
 echo "SENTINEL" > "$KEY"
+out=$(run keygen 2>&1)
+has  "keygen: refuses to clobber an existing key" "$out" "Key already exists"
 out=$(run setup 2>&1)
-has  "setup: refuses to clobber an existing key" "$out" "Key already exists"
-is   "setup: existing key untouched"          "$(cat "$KEY")" "SENTINEL"
-out=$(run setup --force 2>&1)
-has  "setup --force: warns the old key stays authorized" "$out" "OLD public key stays authorized"
-is   "setup --force: key replaced"            "$(cat "$KEY")" "MOCK-PRIVATE-KEY"
+has  "keygen: 'setup' still works as the old name" "$out" "Key already exists"
+is   "keygen: existing key untouched"          "$(cat "$KEY")" "SENTINEL"
+out=$(run keygen --force 2>&1)
+has  "keygen --force: warns the old key stays authorized" "$out" "OLD public key stays authorized"
+is   "keygen --force: key replaced"            "$(cat "$KEY")" "MOCK-PRIVATE-KEY"
 
 # === discover ===============================================================
 echo "-- discover"
-reset; withkey; conf "FLEET_KEY=\"$KEY\""
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_CONTROLLER="self"'
 out=$(run discover 2>&1)
 has  "discover: finds node1"                  "$out" "192.168.1.2"
 has  "discover: finds node2"                  "$out" "192.168.1.3"
-hasnt "discover: excludes the controller (role 1)" "$out" "192.168.1.1"
-has  "discover: suggests a FLEET_NODES line"  "$out" 'FLEET_NODES="192.168.1.2,mac=AA:BB:CC:DD:EE:02'
+has  "discover: includes the controller"      "$out" "[controller]"
+has  "discover: controller offered as 'self'" "$out" "self (192.168.1.1)"
+has  "discover: suggests a FLEET_NODES line"  "$out" 'FLEET_NODES="'
 has  "discover: pins MACs in the suggestion"  "$out" "mac=AA:BB:CC:DD:EE:03"
+has  "discover: self spec needs no pin"       "$out" "self,name=controller"
 has  "discover: labels the Merlin node"       "$out" "merlin: yes"
 has  "discover: labels the stock node"        "$out" "merlin: no"
-has  "discover: explains why pins matter"     "$out" "DHCP moves addresses"
+has  "discover: explains why pins matter"     "$out" "pins are not decoration"
+has  "discover: says the controller is optional" "$out" "Delete it if you only want the nodes"
+
+# from a workstation: no local nvram to ask, so discovery hops to the controller
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_CONTROLLER="192.168.1.1"'
+out=$(run discover 2>&1)
+has  "discover: fetches the list over SSH"    "$(cat "$TMP/sshlog")" "cfg_device_list"
+has  "discover: remote controller yields nodes" "$out" "192.168.1.2"
+has  "discover: remote controller is a normal SSH target" "$out" "192.168.1.1,mac=AA:BB:CC:DD:EE:01"
+hasnt "discover: no 'self' when the controller is remote" "$out" "self,name="
 
 reset; withkey; conf "FLEET_KEY=\"$KEY\""
-nvram set cfg_device_list= 2>/dev/null; printf 'cfg_device_list=\n' >> "$NVRAM_STATE"
-sed -i.bak '/^cfg_device_list=</d' "$NVRAM_STATE"
+out=$(run discover 2>&1); rc=$?
+nonzero "discover: no controller configured exits non-zero" "$rc"
+has  "discover: says how to set the controller" "$out" "FLEET_CONTROLLER="
+
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_CONTROLLER="self"'
+sed -i.bak '/^cfg_device_list=/d' "$NVRAM_STATE"
 out=$(run discover 2>&1); rc=$?
 nonzero "discover: empty list exits non-zero" "$rc"
 has  "discover: empty list explains manual config" "$out" 'FLEET_NODES="192.168.1.2 192.168.1.3"'
 
-reset; withkey; conf "FLEET_KEY=\"$KEY\""
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_CONTROLLER="self"'
 sed -i.bak 's/^cfg_device_list=.*/cfg_device_list=SOMETHING-UNPARSEABLE-FROM-OTHER-FIRMWARE/' "$NVRAM_STATE"
 out=$(run discover 2>&1); rc=$?
 nonzero "discover: unknown format exits non-zero" "$rc"
 has  "discover: unknown format prints the raw value" "$out" "SOMETHING-UNPARSEABLE-FROM-OTHER-FIRMWARE"
 has  "discover: unknown format falls back to manual" "$out" "by hand"
+
+# === self / local target ====================================================
+echo "-- self (local execution)"
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="self"'
+out=$(run run 'echo LOCALLY-EXECUTED' 2>&1); rc=$?
+has  "self: the command runs on this machine" "$out" "[self] LOCALLY-EXECUTED"
+is   "self: no SSH client was involved"       "$([ -s "$TMP/sshlog" ] && echo used)" ""
+is   "self: success exits zero"               "$rc" "0"
+
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="self"'
+out=$(run run 'exit 7' 2>&1); rc=$?
+has  "self: local exit status is preserved"   "$out" "exit 7"
+nonzero "self: local failure => non-zero exit" "$rc"
+
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="self"' 'FLEET_RUN_TIMEOUT=1'
+out=$(run run 'sleep 4' 2>&1)
+has  "self: the watchdog applies locally too" "$out" "timed out after 1s"
+
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="self"'
+out=$(run install https://example.invalid/addon.sh 2>&1); rc=$?
+has  "self: install runs locally"             "$out" "Installed and HEALING"
+is   "self: install needs no mac pin"         "$rc" "0"
+
+# the machine stops looking like an ASUS unit -> mutating verbs must refuse
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="self"'
+sed -i.bak '/^productid=/d' "$NVRAM_STATE"
+out=$(run install https://example.invalid/addon.sh 2>&1); rc=$?
+has  "self: refused when this is not an ASUS unit" "$out" "this machine is not an ASUS router"
+nonzero "self: non-router refusal exits non-zero" "$rc"
+out=$(run run 'echo STILL-FINE' 2>&1)
+has  "self: 'run' still works off-router"     "$out" "[self] STILL-FINE"
+
+# installing fleetctl onto itself would rewrite the running script
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="self 192.168.1.2,mac=AA:BB:CC:DD:EE:02"'
+out=$(run install https://example.invalid/asuswrt-merlin-fleetctl/main/install.sh 2>&1); rc=$?
+has  "self: refuses to install fleetctl over itself" "$out" "installing over a running script is undefined"
+has  "self: points at 'update' instead"       "$out" "fleetctl update"
+nonzero "self: self-install refusal exits non-zero" "$rc"
+
+# an explicit `self` is opt-in, so --include-self must not be needed for it
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="self"'
+out=$(run run 'echo NO-FLAG-NEEDED' 2>&1)
+hasnt "self: not subject to the self-exclusion guard" "$out" "controller itself"
+has  "self: runs without --include-self"      "$out" "NO-FLAG-NEEDED"
+
+# === workstation ergonomics =================================================
+echo "-- workstation"
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2"' 'FLEET_USER=""'
+run run true >/dev/null 2>&1
+hasnt "workstation: no user is forced onto the target" "$(cat "$TMP/sshlog")" "@192.168.1.2"
+has  "workstation: bare host lets ~/.ssh/config decide" "$(cat "$TMP/sshlog")" " 192.168.1.2 "
+
+reset; conf 'FLEET_NODES="192.168.1.2,mac=AA:BB:CC:DD:EE:02"' "FLEET_KEY=\"$TMP/absent.key\""
+out=$(run health 2>&1); rc=$?
+has  "workstation: a missing key is not a failure" "$out" "relying on your own ~/.ssh"
+is   "workstation: health still passes"       "$rc" "0"
 
 # === node specs =============================================================
 echo "-- node specs"
@@ -360,12 +455,43 @@ out=$(run push "$TMP/payload" /jffs/scripts/payload 2>&1)
 has  "push: skips an ineligible node"         "$out" "not Merlin-eligible"
 is   "push: nothing written to a skipped node" "$([ -f "$TMP/pushed-192.168.1.3" ] && echo y)" ""
 
+# === consumer integration (addons depending on fleetctl) ====================
+echo "-- consumer integration"
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2 192.168.1.9"'
+out=$(run --porcelain run uptime 2>&1); rc=$?
+has  "porcelain: stable tab-separated OK row"   "$out" "$(printf 'fleetctl\t192.168.1.2\tOK')"
+has  "porcelain: stable tab-separated FAIL row" "$out" "$(printf 'fleetctl\t192.168.1.9\tFAIL')"
+hasnt "porcelain: no decorative summary box"    "$out" "--- summary ---"
+nonzero "porcelain: exit code still reflects failure" "$rc"
+
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.3,mac=AA:BB:CC:DD:EE:03"'
+out=$(run --porcelain install https://example.invalid/addon.sh 2>&1)
+has  "porcelain: SKIPPED is machine-readable"   "$out" "$(printf 'fleetctl\t192.168.1.3\tSKIPPED')"
+
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2,mac=AA:BB:CC:DD:EE:02"'
+out=$(FLEETCTL_LIB=1 "$SH" -c '. "$1"; fleet_spec 192.168.1.2,mac=AA:BB:CC:DD:EE:02,name=alpha; echo "$SPEC_NAME/$SPEC_MAC"; fleet_version' _ "$FLEETCTL" 2>&1)
+has  "lib mode: sourcing exposes fleet_spec"    "$out" "alpha/AA:BB:CC:DD:EE:02"
+VER=$(awk -F= '/^VERSION=/{print $2; exit}' "$FLEETCTL")
+has  "lib mode: fleet_version reports the script version" "$out" "$VER"
+env_out=$(FLEETCTL_LIB=1 "$SH" "$FLEETCTL" run 'echo SHOULD-NOT-RUN' 2>&1)
+hasnt "lib mode: loading never executes a verb" "$env_out" "SHOULD-NOT-RUN"
+
 # === health =================================================================
 echo "-- health"
+# On the ROUTER a missing key IS a failure — there is no ~/.ssh to fall back on.
+# FLEETCTL_PLATFORM forces the branch so both platforms stay covered.
 reset; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES=""'
-out=$(run health 2>&1); rc=$?
-has  "health: missing key is a FAIL"          "$out" "no key at"
-nonzero "health: FAIL => non-zero exit"       "$rc"
+out=$(runp router health 2>&1); rc=$?
+has  "health (router): missing key is a FAIL" "$out" "no key at"
+nonzero "health (router): FAIL => non-zero exit" "$rc"
+
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES=""'
+out=$(runp router health 2>&1)
+has  "health (router): checks jffs2_scripts"  "$out" "JFFS custom scripts enabled"
+has  "health (router): names the unit"        "$out" "running on the router"
+out=$(run health 2>&1)
+has  "health (workstation): says so"          "$out" "running on a workstation"
+hasnt "health (workstation): no local jffs2_scripts check" "$out" "JFFS custom scripts"
 
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2,mac=AA:BB:CC:DD:EE:02"'
 out=$(run health 2>&1); rc=$?

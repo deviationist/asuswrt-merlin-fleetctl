@@ -6,16 +6,23 @@
 # addons. It knows nothing about any specific addon.
 #
 # TRUST MODEL (the load-bearing design decision):
-#   The USER prepares the trust; fleetctl only consumes it. `setup` creates a
-#   keypair (file creation only, in fleetctl's OWN path — never /jffs/.ssh/,
-#   which holds the firmware's sshd HOST keys) and PRINTS the public key. The
-#   user pastes it into the router GUI's SSH authorized-keys field, and AiMesh
-#   syncs that field byte-for-byte to every node — current and future. Zero
-#   per-node steps, and the password escape hatch is never touched.
+#   The USER prepares the trust; fleetctl only CONSUMES it. Credentials are
+#   referenced from the config (FLEET_KEY, user=, auth=) — fleetctl does not
+#   install, authorize, or manage them anywhere on any system. The operator
+#   pastes their public key into the router GUI's SSH authorized-keys field
+#   once, and AiMesh syncs that field byte-for-byte to every node, current and
+#   future. Zero per-node steps, and the password escape hatch is untouched.
+#
+#   The single exception is `keygen`, which is never run for you (not by the
+#   installer, not by another verb): it writes a keypair into fleetctl's OWN
+#   directory and prints the public half. It authorizes nothing. Point
+#   FLEET_KEY at a key you already have and you never need it at all.
 #
 # NON-GOALS (stated so they cannot drift):
 #   - fleetctl NEVER writes sshd_authkeys or any AiMesh-synced / security-
-#     relevant nvram, on this router or on a node.
+#     relevant nvram, on this router or on a node. It does not add public keys
+#     to any authorized_keys file, set any password, or read one from disk —
+#     provisioning credentials is the operator's job, outside this tool.
 #   - fleetctl NEVER restarts cfg_client / cfg_server. Corrupted cfg-sync is
 #     unrecoverable for a non-expert user; breaking the mesh is not an
 #     acceptable failure mode for an orchestration tool.
@@ -24,21 +31,48 @@
 #     `install <url> uninstall`).
 #
 # Usage: fleetctl [global flags] <verb> [args]   — see the bottom of this file.
-VERSION=0.1.0
+VERSION=0.2.0
 TAG=fleetctl
 REPO_RAW="https://raw.githubusercontent.com/deviationist/asuswrt-merlin-fleetctl/main"
 UPDATE_TMP=/tmp/fleetctl.update.sh          # transient installer copy for 'update' (RAM)
 
-# FLEETCTL_CONF / FLEETCTL_HOME overrides = testability (the test suite drives
-# the REAL script; nothing below is a test-only code path).
-CONF="${FLEETCTL_CONF:-/jffs/scripts/fleetctl.conf}"
-FLEET_HOME="${FLEETCTL_HOME:-/jffs/scripts/fleetctl.d}"   # our own known_hosts lives here
+# --- where are we running? ------------------------------------------------
+# fleetctl runs BOTH on the router (the AiMesh controller, orchestrating its
+# own mesh) and on a workstation (orchestrating the mesh over the LAN/VPN).
+# Almost everything is identical; what differs is where config lives, how keys
+# are generated, and whether `self` is a plausible install target.
+#
+# Detection is `[ -d /jffs ]`, NOT `which nvram`: macOS ships its own
+# /usr/sbin/nvram (Apple's, unrelated), so probing for the binary would
+# misidentify every Mac as a router. Asking nvram for an ASUS-only variable is
+# the confirmation.
+if [ -n "${FLEETCTL_PLATFORM:-}" ]; then
+  PLATFORM=$FLEETCTL_PLATFORM            # override = testability (both branches)
+elif [ -d /jffs ] && [ -n "$(nvram get productid 2>/dev/null)" ]; then
+  PLATFORM=router
+else
+  PLATFORM=workstation
+fi
+if [ "$PLATFORM" = "router" ]; then
+  CONFDIR=/jffs/scripts
+  DEF_HOME=/jffs/scripts/fleetctl.d      # our own known_hosts (see _detect_ssh)
+else
+  CONFDIR="${XDG_CONFIG_HOME:-$HOME/.config}/fleetctl"
+  DEF_HOME=""                            # use the user's real ~/.ssh — see below
+fi
+# FLEETCTL_* overrides = testability (the suite drives the REAL script; nothing
+# below is a test-only code path) and, for CONF, "keep several fleets".
+CONF="${FLEETCTL_CONF:-$CONFDIR/fleetctl.conf}"
+FLEET_HOME="${FLEETCTL_HOME:-$DEF_HOME}"
+FLEET_JFFS="${FLEETCTL_JFFS:-/jffs/scripts}"   # probed path; overridable for tests
 
 # --- defaults (defined BEFORE sourcing the conf so the conf can override) ---
 FLEET_NODES=""                        # explicit node specs — the runtime source of truth
-FLEET_USER=""                         # empty => nvram http_username (AiMesh syncs it)
+FLEET_CONTROLLER=""                   # where 'discover' asks; empty => self on a router
+FLEET_USER=""                         # empty => nvram http_username on a router; else
+                                      # unset, so ~/.ssh/config decides (workstation)
 FLEET_PORT=""                         # empty => nvram sshd_port, else 22
-FLEET_KEY="/jffs/scripts/fleetctl.key" # must not contain spaces (see _ssh_opts)
+FLEET_KEY="$CONFDIR/fleetctl.key"     # must not contain spaces (see _ssh_opts)
 FLEET_ALLOW_PASSWORD=0                # 1 = permit the discouraged password fallback
 FLEET_STRICT_HOSTKEY=0                # 1 = never auto-accept an unknown host key
 FLEET_PROBE_TIMEOUT=20                # seconds, per-node identity/eligibility probe
@@ -46,24 +80,30 @@ FLEET_RUN_TIMEOUT=120                 # seconds, per-node `run`
 FLEET_INSTALL_TIMEOUT=600             # seconds, per-node `install` (downloads + install)
 [ -f "$CONF" ] && . "$CONF"
 
-# A comma-separated FLEET_NODES is a likely user slip, but commas are also our
-# per-node field separator — so only split on whitespace, and let the spec
-# parser deal with the rest.
-[ -n "$FLEET_USER" ] || FLEET_USER=$(nvram get http_username 2>/dev/null)
-[ -n "$FLEET_USER" ] || FLEET_USER=admin
-[ -n "$FLEET_PORT" ] || FLEET_PORT=$(nvram get sshd_port 2>/dev/null)
+# On a router the admin identity is known (and AiMesh-synced mesh-wide), so it
+# is a good default. On a workstation an EMPTY user is deliberate: fleetctl then
+# connects as plain `host`, letting the operator's existing ~/.ssh/config supply
+# user, port, and key — so `FLEET_NODES="router"` works with no fleetctl config
+# at all if that Host block already exists.
+if [ "$PLATFORM" = "router" ]; then
+  [ -n "$FLEET_USER" ] || FLEET_USER=$(nvram get http_username 2>/dev/null)
+  [ -n "$FLEET_USER" ] || FLEET_USER=admin
+  [ -n "$FLEET_PORT" ] || FLEET_PORT=$(nvram get sshd_port 2>/dev/null)
+  [ -n "$FLEET_CONTROLLER" ] || FLEET_CONTROLLER=self
+fi
 [ -n "$FLEET_PORT" ] || FLEET_PORT=22
 
 # --- global flags (parsed by the dispatcher at the bottom) ---
 DRY_RUN=0
 INCLUDE_SELF=0
 ALLOW_UNPINNED=0
+PORCELAIN=0
 
 # Per-node identity + eligibility, in ONE round trip. The __fleetprobe__ token
 # marks OUR line so a login banner can't be mistaken for the answer. An empty
 # model means "nvram did not answer" — i.e. not an ASUS unit at all, which is
 # a hard stop for anything mutating (see _require_target).
-PROBE='m=""; for v in lan_hwaddr label_mac et0macaddr et1macaddr; do x=$(nvram get $v 2>/dev/null); [ -n "$x" ] && m="$m$x,"; done; [ -d /jffs/scripts ] && d=yes || d=no; echo "__fleetprobe__ v=1 model=$(nvram get productid 2>/dev/null | tr " " "_") jffs=$(nvram get jffs2_scripts 2>/dev/null) dir=$d macs=$m"'
+PROBE='m=""; for v in lan_hwaddr label_mac et0macaddr et1macaddr; do x=$(nvram get $v 2>/dev/null); [ -n "$x" ] && m="$m$x,"; done; [ -d '"$FLEET_JFFS"' ] && d=yes || d=no; echo "__fleetprobe__ v=1 model=$(nvram get productid 2>/dev/null | tr " " "_") jffs=$(nvram get jffs2_scripts 2>/dev/null) dir=$d macs=$m"'
 
 die()  { echo "ERROR: $1" >&2; exit 1; }
 warn() { echo "warn: $1" >&2; }
@@ -115,7 +155,7 @@ _parse_spec() {
   _s=$1
   SPEC_RAW=$_s
   SPEC_USER=$FLEET_USER; SPEC_PORT=$FLEET_PORT; SPEC_KEY=""; SPEC_AUTH=""
-  SPEC_MAC=""; SPEC_NAME=""
+  SPEC_MAC=""; SPEC_NAME=""; SPEC_LOCAL=0
   # trailing key=value fields
   case "$_s" in
     *,*) _fields=${_s#*,}; _s=${_s%%,*} ;;
@@ -129,6 +169,14 @@ _parse_spec() {
     *:*)     SPEC_PORT=${_s##*:}; _s=${_s%:*} ;;
   esac
   SPEC_HOST=$_s
+  # `self` (alias `local`) targets THIS machine, executed directly instead of
+  # over SSH — no hop, and no requirement that the unit authorize its own key.
+  # Listing it in FLEET_NODES is itself the opt-in, so it is not subject to the
+  # --include-self guard (that guard exists for a node whose ADDRESS happens to
+  # resolve to the controller, which is a different, accidental case).
+  case "$SPEC_HOST" in
+    self|local) SPEC_LOCAL=1; SPEC_NAME=self ;;
+  esac
   if [ -n "$_fields" ]; then
     for _f in $(echo "$_fields" | tr ',' ' '); do
       case "$_f" in
@@ -151,10 +199,14 @@ _parse_spec() {
     key|'')        : ;;
     *)             SPEC_KEY=$SPEC_AUTH ;;   # tolerate auth=<path> as a key path
   esac
-  if [ "$SPEC_PASS" = "0" ] && [ -z "$SPEC_KEY" ]; then
+  if [ "$SPEC_LOCAL" = "1" ]; then
+    SPEC_PASS=0; SPEC_KEY=""            # nothing to authenticate to
+  elif [ "$SPEC_PASS" = "0" ] && [ -z "$SPEC_KEY" ]; then
     if [ -f "$FLEET_KEY" ]; then SPEC_KEY=$FLEET_KEY
     elif [ "$FLEET_ALLOW_PASSWORD" = "1" ]; then SPEC_PASS=1
     fi
+    # On a workstation, no key is not an error: OpenSSH may authenticate from
+    # ~/.ssh/config or an agent. We simply pass no -i and let it decide.
   fi
 }
 
@@ -170,10 +222,10 @@ _password_for() {
   if [ -z "$_pw" ]; then
     # Never block waiting for input that can never arrive: a cron-driven or
     # piped invocation has no TTY, and a prompt there would hang forever.
-    _have_tty || die "password auth needs a terminal, and this invocation has no TTY (cron/pipe?). Use key auth: fleetctl setup"
+    _have_tty || die "password auth needs a terminal, and this invocation has no TTY (cron/pipe?). Use key auth: fleetctl keygen"
     echo "FLEET_ALLOW_PASSWORD — using password auth for $1. This is the discouraged path:" >&2
     echo "  the mesh admin password transits process environments on every hop." >&2
-    echo "  Set up the key instead; it is one paste: fleetctl setup" >&2
+    echo "  Set up the key instead; it is one paste: fleetctl keygen" >&2
     printf 'password for %s@%s: ' "$SPEC_USER" "$1" >&2
     # stty acts on ITS stdin — redirect it, or a piped invocation silently echoes
     stty -echo < /dev/tty 2>/dev/null
@@ -207,14 +259,22 @@ _detect_ssh() {
     echo "$_h" | grep -q '^-K ' && DB_HAS_K=1     # keepalive => dead peers are noticed
     echo "$_h" | grep -q '^-M ' && DB_HAS_M=1     # in-client max session duration
   fi
-  # Our own known_hosts, so TOFU state is fleetctl's and not root's. Kept on
-  # /jffs because it must survive reboots — it is a few hundred bytes, written
-  # once per node, which is within the flash-wear rule. dropbear finds it via
-  # $HOME, so HOME is repointed for this whole process (a `HOME=x func` prefix
-  # would NOT be reliably scoped: POSIX leaves assignments before a function
-  # call persisting in the shell, so scoping it that way only looks local).
-  [ -d "$FLEET_HOME/.ssh" ] || mkdir -p "$FLEET_HOME/.ssh" 2>/dev/null
-  HOME="$FLEET_HOME"; export HOME
+  # ROUTER ONLY: keep TOFU state in fleetctl's own known_hosts rather than
+  # root's. It lives on /jffs because it must survive reboots — a few hundred
+  # bytes, written once per node, within the flash-wear rule. dropbear finds it
+  # via $HOME, so HOME is repointed for this whole process (a `HOME=x func`
+  # prefix would NOT be reliably scoped: POSIX leaves assignments before a
+  # function call persisting in the shell, so scoping it that way only looks
+  # local).
+  #
+  # On a WORKSTATION we deliberately do NOT do this: repointing HOME would hide
+  # the operator's ~/.ssh/config, agent and keys — the very things that make
+  # `FLEET_NODES="router"` work with no fleetctl config at all. There, ordinary
+  # OpenSSH known_hosts + StrictHostKeyChecking=accept-new give the same TOFU.
+  if [ -n "$FLEET_HOME" ]; then
+    [ -d "$FLEET_HOME/.ssh" ] || mkdir -p "$FLEET_HOME/.ssh" 2>/dev/null
+    HOME="$FLEET_HOME"; export HOME
+  fi
   return 0
 }
 
@@ -222,7 +282,8 @@ _detect_ssh() {
 # caller, so FLEET_KEY / key= paths must not contain spaces (documented).
 _ssh_opts() {
   if [ "$SSH_FLAVOR" = "openssh" ]; then
-    o="-p $SPEC_PORT -o ConnectTimeout=10 -o UserKnownHostsFile=$FLEET_HOME/.ssh/known_hosts"
+    o="-p $SPEC_PORT -o ConnectTimeout=10"
+    [ -n "$FLEET_HOME" ] && o="$o -o UserKnownHostsFile=$FLEET_HOME/.ssh/known_hosts"
     [ "$SPEC_PASS" = "1" ] || o="$o -o BatchMode=yes"
     [ "$FLEET_STRICT_HOSTKEY" = "1" ] || o="$o -o StrictHostKeyChecking=accept-new"
     [ -n "$SPEC_KEY" ] && [ -f "$SPEC_KEY" ] && o="$o -o IdentitiesOnly=yes -i $SPEC_KEY"
@@ -263,7 +324,13 @@ _with_timeout() {
   _mark="$TMPBASE.timedout"; rm -f "$_mark"; TIMED_OUT=0
   "$@" < "$RUN_STDIN" &
   _cpid=$!
-  ( sleep "$_cap"; kill "$_cpid" 2>/dev/null && : > "$_mark" ) &
+  # The sleeper's output MUST be detached from ours. A background child inherits
+  # the parent's stdout, and a command substitution — `raw=$(_run_on …)`, as
+  # discovery uses — does not return until every writer to that pipe closes it.
+  # Without this redirect the watchdog holds the pipe for its full duration, so
+  # a call that already succeeded still blocks for the whole timeout (a 20 s
+  # stall on every `discover`). Caught by running the suite under dash.
+  ( sleep "$_cap"; kill "$_cpid" 2>/dev/null && : > "$_mark" ) >/dev/null 2>&1 &
   _wpid=$!
   wait "$_cpid"; _rc=$?
   kill "$_wpid" 2>/dev/null
@@ -274,11 +341,29 @@ _with_timeout() {
 
 # _run_on <max_seconds> <command-string>   (uses the SPEC_* of the current node)
 _run_on() {
+  _cap=$1
+  # `self`: run it here. Same watchdog, same stdin handling, same result
+  # accounting — only the transport differs, so every gate and every summary
+  # line behaves identically whether a target is local or remote.
+  if [ "$SPEC_LOCAL" = "1" ]; then
+    _with_timeout "$_cap" sh -c "$2"
+    return $?
+  fi
   _detect_ssh || die "no SSH client found (looked for dbclient, ssh)"
   [ "$SPEC_PASS" = "1" ] && _password_for "$SPEC_HOST"
-  _cap=$1
+  # An empty user means "let ~/.ssh/config decide" (workstation default), so the
+  # target is passed as a bare host rather than as `@host`.
+  if [ -n "$SPEC_USER" ]; then _tgt="$SPEC_USER@$SPEC_HOST"; else _tgt="$SPEC_HOST"; fi
   # shellcheck disable=SC2086  — word splitting of the option list is intended
-  _with_timeout "$_cap" "$SSH_BIN" $(_ssh_opts "$_cap") "$SPEC_USER@$SPEC_HOST" "$2"
+  _with_timeout "$_cap" "$SSH_BIN" $(_ssh_opts "$_cap") "$_tgt" "$2"
+}
+
+# How this target is being reached, for the per-node headers.
+_target_desc() {
+  if [ "$SPEC_LOCAL" = "1" ]; then echo "this machine, run locally"
+  elif [ -n "$SPEC_USER" ]; then echo "$SPEC_USER@$SPEC_HOST:$SPEC_PORT"
+  else echo "$SPEC_HOST (via ~/.ssh/config)"
+  fi
 }
 
 # --- probe / identity -------------------------------------------------------
@@ -289,7 +374,7 @@ _probe() {
   # whole fan-out (continue-on-error: a half-run mesh with no record of where
   # it stopped is worse than a full run with failures listed).
   if [ "$SPEC_PASS" = "1" ] && [ "$FLEET_ALLOW_PASSWORD" != "1" ]; then
-    P_REASON="spec requests password auth, but FLEET_ALLOW_PASSWORD=0 in $CONF (key auth is the supported path: fleetctl setup)"
+    P_REASON="spec requests password auth, but FLEET_ALLOW_PASSWORD=0 in $CONF (key auth is the supported path: fleetctl keygen)"
     return 1
   fi
   _err="$TMPBASE.err"; _out="$TMPBASE.probe"
@@ -357,6 +442,20 @@ _pin_matches() {
 SUMMARY="$TMPBASE.summary"
 _result() { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$SUMMARY"; }
 _print_summary() {
+  # --porcelain is a PUBLIC CONTRACT for consuming addons (see README, "Using
+  # fleetctl from your own addon"). Columns are fixed and tab-separated:
+  #   fleetctl<TAB>node<TAB>OK|FAIL|SKIPPED<TAB>reason
+  # Never reorder or repurpose them; add new columns at the END if you must.
+  if [ "$PORCELAIN" = "1" ]; then
+    [ -f "$SUMMARY" ] || return 1
+    _fail=0
+    while IFS="$(printf '\t')" read -r h st reason; do
+      [ "$st" = "OK" ] || [ "$st" = "SKIPPED" ] || _fail=$((_fail+1))
+      printf 'fleetctl\t%s\t%s\t%s\n' "$h" "$st" "$reason"
+    done < "$SUMMARY"
+    [ "$_fail" = "0" ]
+    return $?
+  fi
   echo
   echo "--- summary ---"
   [ -f "$SUMMARY" ] || { echo "  (no nodes processed)"; return 1; }
@@ -387,18 +486,26 @@ _nodes_or_die() {
 _require_target() {
   _mut=$1; GATE=fail; GATE_REASON=""
   if ! _probe; then GATE_REASON="$P_REASON"; return 1; fi
-  if _is_self && [ "$INCLUDE_SELF" != "1" ]; then
-    GATE=skip; GATE_REASON="this is the controller itself (--include-self to include it)"; return 1
+  if [ "$SPEC_LOCAL" != "1" ] && _is_self && [ "$INCLUDE_SELF" != "1" ]; then
+    GATE=skip; GATE_REASON="this is the controller itself (list it as 'self' to include it, or pass --include-self)"; return 1
   fi
   if [ "$_mut" = "1" ]; then
     if [ -z "$P_MODEL" ]; then
-      GATE_REASON="refusing: the host at this address did not identify as an ASUS unit"; return 1
+      if [ "$SPEC_LOCAL" = "1" ]; then
+        GATE_REASON="refusing: this machine is not an ASUS router, so 'self' is not an install target here. Run fleetctl ON the unit you want to install on, or target it over SSH"
+      else
+        GATE_REASON="refusing: the host at this address did not identify as an ASUS unit"
+      fi
+      return 1
     fi
     if [ -n "$SPEC_MAC" ]; then
       if ! _pin_matches; then
         GATE_REASON="refusing: MAC pin $SPEC_MAC does not match this host ($P_MODEL). DHCP may have moved the address — re-run 'fleetctl discover'"; return 1
       fi
-    elif [ "$ALLOW_UNPINNED" != "1" ]; then
+    elif [ "$SPEC_LOCAL" != "1" ] && [ "$ALLOW_UNPINNED" != "1" ]; then
+      # A pin defends against "that address points somewhere else now". A local
+      # target has no address indirection to be wrong about, so requiring one
+      # there would be ceremony, not safety.
       GATE_REASON="refusing: no MAC pin for this node, and this verb runs as root on it. Add mac=… (see 'fleetctl discover'), or pass --allow-unpinned"; return 1
     fi
     if ! _eligible; then
@@ -415,10 +522,28 @@ _require_target() {
 
 # --- verbs ------------------------------------------------------------------
 
-cmd_setup() {
-  which dropbearkey >/dev/null 2>&1 || die "dropbearkey not found — is this an Asuswrt-Merlin router?"
+# `keygen` is the ONLY command that creates credential material, it is never
+# run for you (not by the installer, not by another verb), and it writes only
+# into fleetctl's own directory. It does not authorize the key anywhere: no
+# authorized_keys, no nvram, no GUI automation. Authorizing is the operator's
+# action, in the GUI, where the password escape hatch still exists.
+cmd_keygen() {
+  # Key generation differs by platform: dropbearkey on the router, ssh-keygen
+  # on a workstation. The PUBLIC key is the same shape either way, which is all
+  # the GUI field cares about.
+  if which dropbearkey >/dev/null 2>&1; then KEYGEN=dropbear
+  elif which ssh-keygen >/dev/null 2>&1; then KEYGEN=openssh
+  else die "neither dropbearkey nor ssh-keygen found — cannot generate a key here"
+  fi
+  mkdir -p "$(dirname "$FLEET_KEY")" 2>/dev/null
+  if [ "$PLATFORM" = "workstation" ] && [ ! -f "$FLEET_KEY" ] && [ "$1" != "--force" ]; then
+    echo "note: on a workstation you may not need a fleetctl key at all — if your"
+    echo "      ~/.ssh already reaches the router (an agent, or a Host block), leave"
+    echo "      FLEET_KEY unset and fleetctl will let OpenSSH authenticate as usual."
+    echo
+  fi
   if [ -f "$FLEET_KEY" ] && [ "$1" != "--force" ]; then
-    echo "Key already exists: $FLEET_KEY  (use 'fleetctl setup --force' to replace it)"
+    echo "Key already exists: $FLEET_KEY  (use 'fleetctl keygen --force' to replace it)"
   else
     if [ -f "$FLEET_KEY" ]; then
       echo "Replacing $FLEET_KEY — the OLD public key stays authorized until you"
@@ -427,13 +552,23 @@ cmd_setup() {
     fi
     # fleetctl's OWN path — deliberately NOT /jffs/.ssh/, which holds the
     # firmware's sshd HOST keys. File creation only; no nvram is written.
-    dropbearkey -t ed25519 -f "$FLEET_KEY" >/dev/null 2>&1 ||
-      dropbearkey -t rsa -s 3072 -f "$FLEET_KEY" >/dev/null 2>&1 ||
-      die "key generation failed (dropbearkey)"
+    if [ "$KEYGEN" = "dropbear" ]; then
+      dropbearkey -t ed25519 -f "$FLEET_KEY" >/dev/null 2>&1 ||
+        dropbearkey -t rsa -s 3072 -f "$FLEET_KEY" >/dev/null 2>&1 ||
+        die "key generation failed (dropbearkey)"
+    else
+      ssh-keygen -q -t ed25519 -N '' -C "fleetctl@$(hostname 2>/dev/null || echo workstation)" -f "$FLEET_KEY" </dev/null >/dev/null 2>&1 ||
+        die "key generation failed (ssh-keygen)"
+    fi
     chmod 600 "$FLEET_KEY"
     echo "Generated $FLEET_KEY"
   fi
-  pub=$(dropbearkey -y -f "$FLEET_KEY" 2>/dev/null | grep -E '^(ssh|ecdsa)-' | head -1)
+  if [ "$KEYGEN" = "dropbear" ]; then
+    pub=$(dropbearkey -y -f "$FLEET_KEY" 2>/dev/null | grep -E '^(ssh|ecdsa)-' | head -1)
+  else
+    pub=$(cat "$FLEET_KEY.pub" 2>/dev/null | grep -E '^(ssh|ecdsa)-' | head -1)
+    [ -n "$pub" ] || pub=$(ssh-keygen -y -f "$FLEET_KEY" 2>/dev/null | head -1)
+  fi
   [ -n "$pub" ] || die "could not read the public key out of $FLEET_KEY"
   echo "$pub" > "$FLEET_KEY.pub"; chmod 644 "$FLEET_KEY.pub"
   cat <<EOF
@@ -459,13 +594,33 @@ EOF
 }
 
 cmd_discover() {
-  raw=$(nvram get cfg_device_list 2>/dev/null)
+  # The mesh membership list lives in the CONTROLLER's nvram, so discovery
+  # always asks the controller — locally when fleetctl runs on it, over SSH
+  # when it runs on a workstation. One code path; `self` just happens to be a
+  # transport that needs no network.
+  if [ -z "$FLEET_CONTROLLER" ]; then
+    die "discovery asks the AiMesh controller, and this machine is not one.
+Set the controller in $CONF, e.g.:
+  FLEET_CONTROLLER=\"192.168.1.1\"        # or a Host alias from ~/.ssh/config
+Discovery is only a convenience — you can also just write FLEET_NODES by hand."
+  fi
+  _parse_spec "$FLEET_CONTROLLER"
+  CTRL_LOCAL=$SPEC_LOCAL; CTRL_NAME=$SPEC_NAME
+  _raw=$(_run_on "$FLEET_PROBE_TIMEOUT" 'nvram get cfg_device_list' 2>/dev/null)
+  # Prefer the line that looks like the list (a login banner may precede it),
+  # but fall back to the last non-empty line so an UNRECOGNISED value still
+  # reaches the parser and gets shown to the user rather than silently dropped.
+  raw=$(echo "$_raw" | grep '>' | head -1)
+  [ -n "$raw" ] || raw=$(echo "$_raw" | grep -v '^[[:space:]]*$' | tail -1)
   if [ -z "$raw" ]; then
-    echo "nvram cfg_device_list is empty."
+    echo "No AiMesh device list came back from the controller ($CTRL_NAME)."
     echo
-    echo "That means this router is not the AiMesh controller, or it has no nodes,"
-    echo "or this firmware keeps the list elsewhere. Discovery is a convenience —"
-    echo "fleetctl works fully without it. Populate $CONF by hand:"
+    echo "Either that unit is not the AiMesh controller, or it has no nodes, or"
+    echo "this firmware keeps the list elsewhere — or fleetctl could not reach it"
+    echo "(try: fleetctl --nodes '$FLEET_CONTROLLER' nodes)."
+    echo
+    echo "Discovery is a convenience; fleetctl works fully without it. Populate"
+    echo "$CONF by hand:"
     echo
     echo '  FLEET_NODES="192.168.1.2 192.168.1.3"'
     exit 1
@@ -482,8 +637,10 @@ cmd_discover() {
   _recs=$(echo "$raw" | tr '<' '\n')
   while IFS='>' read -r h ip mac role _rest; do
     case "$ip" in ''|*[!0-9.]*) continue ;; esac      # field 2 must look like an IP
-    [ "$role" = "1" ] && continue                      # the controller lists itself
-    cands="$cands$ip|${h:-node}|$(echo "$mac" | tr 'a-z' 'A-Z')
+    # role 1 = the controller (it lists itself; NOT necessarily first — order
+    # carries no meaning, only the role field does). It is a legitimate fleet
+    # member: the addon usually wants to run on every unit, controller included.
+    cands="$cands$ip|${h:-node}|$(echo "$mac" | tr 'a-z' 'A-Z')|${role:-0}
 "
   done <<EOF
 $_recs
@@ -504,21 +661,31 @@ EOF
   # A read-loop (not `for c in $cands`) so a node name containing a space cannot
   # split into two bogus rows — and fed by a heredoc rather than a pipe, so the
   # loop runs in THIS shell and $specline survives it.
-  while IFS='|' read -r ip label mac; do
+  while IFS='|' read -r ip label mac role; do
     [ -n "$ip" ] || continue
-    _parse_spec "$ip"
+    label=$(echo "$label" | tr ' ,' '__')             # specs are whitespace-free
+    # If the controller is the machine we are running on, target it as `self`:
+    # local execution needs no key authorized on itself and no network hop.
+    # From a workstation it is just another SSH target like any node.
+    if [ "$role" = "1" ] && [ "$CTRL_LOCAL" = "1" ]; then
+      spec="self,name=$label"; shown="self ($ip)"
+    elif [ -n "$mac" ]; then
+      spec="$ip,mac=$mac,name=$label"; shown="$ip"
+    else
+      spec="$ip,name=$label"; shown="$ip"
+    fi
+    _parse_spec "$spec"
+    tag=""; [ "$role" = "1" ] && tag=" [controller]"
     if _probe; then
       if _eligible; then
-        printf '  %-15s %-14s %-10s auth: ok    merlin: yes  (run + install)\n' "$ip" "$label" "$P_MODEL"
+        printf '  %-16s %-14s %-10s auth: ok    merlin: yes  (run + install)%s\n' "$shown" "$label" "$P_MODEL" "$tag"
       else
-        printf '  %-15s %-14s %-10s auth: ok    merlin: no   (run only)\n' "$ip" "$label" "$P_MODEL"
+        printf '  %-16s %-14s %-10s auth: ok    merlin: no   (run only)%s\n' "$shown" "$label" "$P_MODEL" "$tag"
       fi
     else
-      printf '  %-15s %-14s %-10s auth: FAIL  %s\n' "$ip" "$label" "-" "$(echo "$P_REASON" | cut -c1-60)"
+      printf '  %-16s %-14s %-10s auth: FAIL  %s\n' "$shown" "$label" "-" "$(echo "$P_REASON" | cut -c1-60)"
     fi
-    label=$(echo "$label" | tr ' ,' '__')             # specs are whitespace-free
-    if [ -n "$mac" ]; then specline="$specline$ip,mac=$mac,name=$label "
-    else specline="$specline$ip,name=$label "; fi
+    specline="$specline$spec "
   done <<EOF
 $cands
 EOF
@@ -528,15 +695,18 @@ Paste this into $CONF:
 
 FLEET_NODES="$(echo "$specline" | sed 's/ *$//')"
 
-The mac= pins matter: FLEET_NODES holds addresses, DHCP moves addresses, and
-'install'/'push' run as root on whatever answers. fleetctl verifies the pin
-before anything mutating, and refuses when it does not match.
+Notes on that line:
+  - The mac= pins are not decoration. FLEET_NODES holds addresses, DHCP moves
+    addresses, and 'install'/'push' run as root on whatever answers. fleetctl
+    verifies the pin before anything mutating and refuses a mismatch.
+  - The [controller] entry is included because an addon usually wants to run on
+    every unit, itself included. Delete it if you only want the nodes.
 EOF
 }
 
 cmd_nodes() {
   _nodes_or_die
-  echo "fleetctl $VERSION — configured nodes (default user: $FLEET_USER, port: $FLEET_PORT):"
+  echo "fleetctl $VERSION — configured nodes (default user: ${FLEET_USER:-<from ~/.ssh/config>}, port: $FLEET_PORT):"
   echo
   rc=0
   for spec in $FLEET_NODES; do
@@ -570,7 +740,7 @@ cmd_run() {
   for spec in $FLEET_NODES; do
     _parse_spec "$spec"
     echo
-    echo "=== $SPEC_NAME ($SPEC_USER@$SPEC_HOST:$SPEC_PORT) ==="
+    echo "=== $SPEC_NAME ($(_target_desc)) ==="
     if ! _require_target 0; then
       echo "  $GATE_REASON"
       [ "$GATE" = "skip" ] && _result "$SPEC_NAME" SKIPPED "$GATE_REASON" || _result "$SPEC_NAME" FAIL "$GATE_REASON"
@@ -615,7 +785,7 @@ cmd_push() {
   for spec in $FLEET_NODES; do
     _parse_spec "$spec"
     echo
-    echo "=== $SPEC_NAME ($SPEC_USER@$SPEC_HOST:$SPEC_PORT) ==="
+    echo "=== $SPEC_NAME ($(_target_desc)) ==="
     if ! _require_target 1; then
       echo "  $GATE_REASON"
       [ "$GATE" = "skip" ] && _result "$SPEC_NAME" SKIPPED "$GATE_REASON" || _result "$SPEC_NAME" FAIL "$GATE_REASON"
@@ -652,6 +822,17 @@ cmd_install() {
   esac
   case "$url" in *\'*) die "URL must not contain a single quote" ;; esac
   _nodes_or_die
+  # Installing FLEETCTL onto a local target would rewrite this very script while
+  # busybox sh is still reading it incrementally — undefined behavior, and the
+  # reason `update` exists (it execs the installer from /tmp first). Catch the
+  # foot-gun rather than documenting it and hoping.
+  case "$url" in
+    *fleetctl*)
+      for _s in $FLEET_NODES; do
+        _parse_spec "$_s"
+        [ "$SPEC_LOCAL" = "1" ] && die "that looks like fleetctl's own installer, and '$SPEC_RAW' is this machine — installing over a running script is undefined. Use 'fleetctl update' for self, and remove 'self' from FLEET_NODES to push fleetctl to the others."
+      done ;;
+  esac
   _lock
   args="$*"
   [ "$DRY_RUN" = "1" ] && echo "DRY RUN — nothing will be installed."
@@ -665,7 +846,7 @@ cmd_install() {
   for spec in $FLEET_NODES; do
     _parse_spec "$spec"
     echo
-    echo "=== $SPEC_NAME ($SPEC_USER@$SPEC_HOST:$SPEC_PORT) ==="
+    echo "=== $SPEC_NAME ($(_target_desc)) ==="
     if ! _require_target 1; then
       echo "  $GATE_REASON"
       [ "$GATE" = "skip" ] && _result "$SPEC_NAME" SKIPPED "$GATE_REASON" || _result "$SPEC_NAME" FAIL "$GATE_REASON"
@@ -701,7 +882,17 @@ cmd_health() {
   note() { echo "  warn: $1"; }
   echo "fleetctl $VERSION health check"
 
-  [ "$(nvram get jffs2_scripts 2>/dev/null)" = "1" ] && ok "JFFS custom scripts enabled" || bad "JFFS custom scripts disabled (nvram jffs2_scripts)"
+  if [ "$PLATFORM" = "router" ]; then
+    ok "running on the router ($(nvram get productid 2>/dev/null))"
+    [ "$(nvram get jffs2_scripts 2>/dev/null)" = "1" ] && ok "JFFS custom scripts enabled" || bad "JFFS custom scripts disabled (nvram jffs2_scripts)"
+    [ -n "$FLEET_CONTROLLER" ] && ok "discovery source: $FLEET_CONTROLLER" || note "no FLEET_CONTROLLER — 'discover' has nothing to ask"
+  else
+    ok "running on a workstation (config: $CONF)"
+    # jffs2_scripts is a property of each TARGET, not of this machine — checking
+    # it locally here would be meaningless, and failing on it would be wrong.
+    if [ -n "$FLEET_CONTROLLER" ]; then ok "discovery source: $FLEET_CONTROLLER"
+    else note "FLEET_CONTROLLER unset — 'discover' cannot ask anyone; set it or write FLEET_NODES by hand"; fi
+  fi
   # NB: no `command` builtin on this busybox — probe with `which`
   if _detect_ssh; then
     ok "SSH client: $SSH_BIN ($SSH_FLAVOR)"
@@ -709,7 +900,9 @@ cmd_health() {
   else
     bad "no SSH client found (dbclient/ssh) — fan-out impossible"
   fi
-  which dropbearkey >/dev/null 2>&1 && ok "dropbearkey available" || note "dropbearkey missing — 'fleetctl setup' cannot generate a key here"
+  if which dropbearkey >/dev/null 2>&1; then ok "key generation: dropbearkey"
+  elif which ssh-keygen >/dev/null 2>&1; then ok "key generation: ssh-keygen"
+  else note "neither dropbearkey nor ssh-keygen — 'fleetctl keygen' cannot generate a key here"; fi
   which curl >/dev/null 2>&1 && ok "curl available (needed by 'update')" || note "curl missing — 'update' will not work"
   [ -d "$FLEET_HOME/.ssh" ] && ok "known_hosts dir: $FLEET_HOME/.ssh" || note "no $FLEET_HOME/.ssh yet (created on first connection)"
 
@@ -725,11 +918,15 @@ cmd_health() {
       -rw-------) ok "key permissions are 0600" ;;
       *) note "key is group/other-readable — chmod 600 $FLEET_KEY" ;;
     esac
-    [ -f "$FLEET_KEY.pub" ] && ok "public key present: $FLEET_KEY.pub" || note "no $FLEET_KEY.pub — run 'fleetctl setup' to re-derive it"
+    [ -f "$FLEET_KEY.pub" ] && ok "public key present: $FLEET_KEY.pub" || note "no $FLEET_KEY.pub — run 'fleetctl keygen' to re-derive it"
   elif [ "$FLEET_ALLOW_PASSWORD" = "1" ]; then
     note "no key ($FLEET_KEY) — falling back to the discouraged password path"
+  elif [ "$PLATFORM" = "workstation" ]; then
+    # Not a failure off-router: OpenSSH may well authenticate from an agent or
+    # a ~/.ssh/config Host block, which is the nicest workstation setup there is.
+    note "no fleetctl key ($FLEET_KEY) — relying on your own ~/.ssh (agent or Host config)"
   else
-    bad "no key at $FLEET_KEY and FLEET_ALLOW_PASSWORD=0 — run 'fleetctl setup'"
+    bad "no key at $FLEET_KEY and FLEET_ALLOW_PASSWORD=0 — run 'fleetctl keygen'"
   fi
   [ "$FLEET_ALLOW_PASSWORD" = "1" ] && note "FLEET_ALLOW_PASSWORD=1 — password auth permitted; it is never stored, but it does transit process environments"
   [ "$FLEET_STRICT_HOSTKEY" = "1" ] && ok "strict host-key checking on" || note "unknown host keys are accepted on first contact (TOFU); a CHANGED key is always refused"
@@ -802,7 +999,8 @@ fleetctl $VERSION — AiMesh fleet orchestration for Asuswrt-Merlin
 usage: fleetctl [flags] <verb> [args]
 
 verbs:
-  setup [--force]          generate the client keypair, print the pubkey to paste
+  keygen [--force]         create a client keypair, print the pubkey to paste
+                           (optional: point FLEET_KEY at an existing key instead)
   discover                 list AiMesh nodes this controller knows about
   nodes                    status of every node configured in fleetctl.conf
   run <command...>         run a command on every node (read-only gate)
@@ -820,12 +1018,15 @@ flags (before the verb):
   --include-self           include the controller in the fan-out (off by default)
   --allow-unpinned         let mutating verbs target nodes with no mac= pin
 
-node spec:  [user@]host[:port][,key=value]...
+node spec:  [user@]host[:port][,key=value]...  |  self
             fields: port= user= key=<file> auth=pass|key mac=<pin> name=<label>
             e.g.    192.168.1.2,mac=AA:BB:CC:DD:EE:FF,name=node1
                     admin@node2.lan:2222,key=/jffs/scripts/node2.key
+                    router                     (a Host alias from ~/.ssh/config)
+                    self                       (this machine, run locally)
 
-config: $CONF
+running on: $PLATFORM
+config:     $CONF
 EOF
 }
 
@@ -837,6 +1038,7 @@ while [ $# -gt 0 ]; do
     --dry-run)        DRY_RUN=1; shift ;;
     --include-self)   INCLUDE_SELF=1; shift ;;
     --allow-unpinned) ALLOW_UNPINNED=1; shift ;;
+    --porcelain)      PORCELAIN=1; shift ;;
     --nodes)          [ -n "$2" ] || die "--nodes needs a value"; FLEET_NODES=$2; shift 2 ;;
     -v|--version)     echo "fleetctl $VERSION"; exit 0 ;;
     -h|--help)        usage; exit 0 ;;
@@ -846,9 +1048,27 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# --- library mode -----------------------------------------------------------
+# `FLEETCTL_LIB=1 . /jffs/scripts/fleetctl` loads the plumbing WITHOUT running a
+# verb, for addons that want to build their own mesh commands on it. The stable
+# surface is the fleet_* wrappers below; the _underscore functions are internal
+# and may change between releases.
+fleet_version()  { echo "$VERSION"; }
+fleet_platform() { echo "$PLATFORM"; }
+fleet_list()     { echo "$FLEET_NODES"; }
+fleet_spec()     { _parse_spec "$1"; }              # -> SPEC_HOST/PORT/USER/MAC/NAME/LOCAL
+fleet_probe()    { _probe; }                        # -> P_MODEL/P_JFFS/P_DIR/P_MACS/P_REASON
+fleet_eligible() { _eligible; }                     # after fleet_probe
+fleet_gate()     { _require_target "$1"; }          # 1 = mutating -> GATE/GATE_REASON
+fleet_exec()     { _run_on "$1" "$2"; }             # <seconds> <command>
+if [ -n "${FLEETCTL_LIB:-}" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 VERB=$1
 case "$VERB" in
-  setup)     shift; cmd_setup "$@" ;;
+  keygen)    shift; cmd_keygen "$@" ;;
+  setup)     shift; cmd_keygen "$@" ;;   # pre-0.2 name, still accepted
   discover)  cmd_discover ;;
   nodes)     cmd_nodes ;;
   run)       shift; cmd_run "$@" ;;

@@ -1,7 +1,7 @@
 # asuswrt-merlin-fleetctl
 
-**Run commands, push files, and roll out addons across a whole AiMesh — from
-the main router, over SSH, with one command.**
+**Run commands, push files, and roll out addons across a whole AiMesh — with
+one command, from the router itself or from your laptop.**
 
 `amtm` manages one router. Addons that need to touch a mesh node each hand-roll
 their own node SSH. `fleetctl` is the missing piece: generic fan-out plumbing —
@@ -43,23 +43,48 @@ place so no addon has to reinvent it.
 
 ## Install
 
-On the router that is your AiMesh **controller** (SSH enabled, JFFS custom
-scripts on):
+The same installer works in both places and detects which it is on.
+
+**On the router** (your AiMesh controller, SSH enabled, JFFS custom scripts on):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/deviationist/asuswrt-merlin-fleetctl/main/install.sh | sh
+```
+
+**On a workstation** (macOS/Linux) — installs to `~/.local/bin`, config in
+`~/.config/fleetctl/`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/deviationist/asuswrt-merlin-fleetctl/main/install.sh | sh
 ```
 
 Re-running is the upgrade path (`fleetctl update` does exactly that). Your
-config is never overwritten.
+config is never overwritten, and installing never creates or authorizes any
+credentials — see [What fleetctl does not touch](#what-fleetctl-does-not-touch).
+
+### Router or workstation?
+
+|  | on the router | on a workstation |
+|---|---|---|
+| config | `/jffs/scripts/fleetctl.conf` | `~/.config/fleetctl/fleetctl.conf` |
+| discovery | reads its own nvram | asks `FLEET_CONTROLLER` over SSH |
+| auth | `FLEET_KEY` (one key, AiMesh-synced) | your existing `~/.ssh` — agent or `Host` block — or `FLEET_KEY` |
+| `self` target | the controller, run locally | refused for `install`/`push` (not an ASUS unit) |
+
+On a workstation fleetctl deliberately connects as a **bare host** when
+`FLEET_USER` is empty, so your `~/.ssh/config` supplies user, port and key.
+If you already have a `Host router` block, `FLEET_NODES="router"` just works.
 
 ## The trust model — one paste, no per-node steps
 
 **You prepare the trust; fleetctl only consumes it.** fleetctl never writes
 `sshd_authkeys` or any other security-relevant nvram.
 
-The installer runs `fleetctl setup`, which generates a keypair in fleetctl's own
-path and prints the public key. Then:
+If you do not already have a key that reaches the router, `fleetctl keygen`
+writes one into fleetctl's own directory and prints the public half. (It is
+never run for you — see [What fleetctl does not touch](#what-fleetctl-does-not-touch).
+Already have a key? Point `FLEET_KEY` at it, or on a workstation just let
+`~/.ssh` do its job.) Then:
 
 1. Router GUI → **Administration → System → "SSH Authentication key"**
 2. Paste the line on its **own line**, keeping any keys already there. Apply.
@@ -89,7 +114,7 @@ fleetctl --dry-run run 'uptime'   # confirm the target list before trusting it
 
 | Verb | What it does | Needs |
 |---|---|---|
-| `setup [--force]` | generate the keypair, print the pubkey to paste | — |
+| `keygen [--force]` | create a keypair, print the pubkey to paste (optional) | — |
 | `discover` | parse `cfg_device_list` → pinned, conf-ready node specs | — |
 | `nodes` | per-node auth / model / pin / eligibility | SSH |
 | `run <cmd…>` | run a command on every node, output prefixed `[node]` | SSH |
@@ -108,6 +133,7 @@ the remote command:
 | `--nodes "<spec> …"` | override `FLEET_NODES` for this invocation |
 | `--include-self` | include the controller in the fan-out (off by default) |
 | `--allow-unpinned` | let mutating verbs target nodes with no `mac=` pin |
+| `--porcelain` | machine-readable per-node results, for consuming addons |
 
 ## Node specs — one list, however your mesh is reachable
 
@@ -118,7 +144,9 @@ spec:
 [user@]host[:port][,key=value]...
 ```
 
-`host` may be an IP or a hostname (or `[v6addr]`). Fields:
+`host` may be an IP, a hostname, an `~/.ssh/config` alias, `[v6addr]` — or the
+literal **`self`**, meaning *this machine, executed locally with no SSH hop*.
+Fields:
 
 | Field | Meaning |
 |---|---|
@@ -135,20 +163,46 @@ FLEET_NODES="192.168.1.2,mac=AA:BB:CC:DD:EE:02,name=attic
 ```
 
 So: same key everywhere, or one key per node; default port, or a custom one;
-IPs, or hostnames; keys, or (reluctantly) a password. Paths in `key=` must not
-contain spaces.
+IPs, hostnames or SSH aliases; keys, or (reluctantly) a password. Paths in
+`key=` must not contain spaces.
+
+### `self` — including the unit you are running on
+
+Running on the controller, you usually want the addon on *that* unit too:
+
+```sh
+FLEET_NODES="self 192.168.1.2,mac=AA:BB:CC:DD:EE:02"
+```
+
+`self` executes directly — no SSH hop, so the unit does not need to authorize
+its own key. Listing it *is* the opt-in, so it is not subject to
+`--include-self` (that flag guards the different, accidental case: a node whose
+*address* happens to resolve to the controller). It needs no `mac=` pin either,
+because a pin defends against an address pointing somewhere unexpected, and
+there is no address involved.
+
+`fleetctl discover` emits `self` for the controller when you run it there, and
+an ordinary pinned spec when you run it from a workstation. On a workstation
+`self` fails the mutating verbs, because your laptop is not an ASUS unit — the
+same identity gate every other target goes through, no special case.
+
+One guard: `fleetctl install <fleetctl's own installer>` with `self` in the
+fleet is refused, because that would rewrite the running script. Use
+`fleetctl update` for this machine.
 
 ## Config
 
-`/jffs/scripts/fleetctl.conf`, created by the installer with commented
-defaults and never overwritten:
+`/jffs/scripts/fleetctl.conf` on a router, `~/.config/fleetctl/fleetctl.conf`
+on a workstation — created by the installer with commented defaults, never
+overwritten:
 
 | Setting | Default | Notes |
 |---|---|---|
 | `FLEET_NODES` | `""` | the fleet. Runtime source of truth |
-| `FLEET_USER` | `nvram http_username` | AiMesh syncs the admin user mesh-wide |
+| `FLEET_CONTROLLER` | `self` on a router, else unset | who `discover` asks |
+| `FLEET_USER` | `nvram http_username` on a router; empty on a workstation | empty = let `~/.ssh/config` decide |
 | `FLEET_PORT` | `nvram sshd_port`, else 22 | |
-| `FLEET_KEY` | `/jffs/scripts/fleetctl.key` | created by `setup` |
+| `FLEET_KEY` | `<confdir>/fleetctl.key` | optional; point it at any key you like |
 | `FLEET_ALLOW_PASSWORD` | `0` | see below |
 | `FLEET_STRICT_HOSTKEY` | `0` | `1` = refuse unknown host keys too |
 | `FLEET_PROBE_TIMEOUT` | `20` | seconds |
@@ -193,6 +247,88 @@ One command, N devices, `curl … | sh` **as root** on each. That changes what
 Stated non-goals: fleetctl **never** writes `sshd_authkeys` or any AiMesh-synced
 nvram, and **never** restarts `cfg_client`/`cfg_server`. It must not be able to
 break your mesh.
+
+## What fleetctl does not touch
+
+fleetctl **consumes** credentials; it does not provision, install or manage
+them. Provisioning is the operator's business, and deliberately outside this
+tool. Concretely, fleetctl never:
+
+- writes `sshd_authkeys`, or **any** nvram variable, on any unit;
+- adds a public key to any `authorized_keys` file, anywhere;
+- stores a password — the opt-in prompt keeps it in process memory for that one
+  invocation and never writes it to disk;
+- reads credentials from anywhere except the config you wrote;
+- restarts `cfg_client` / `cfg_server`, or does anything else that could break
+  AiMesh itself.
+
+The config names *which* key, user, port or auth method to connect with. That is
+the whole of fleetctl's involvement with credentials.
+
+The one command that creates key material is **`keygen`**, and it is a
+convenience you can ignore: it writes a keypair into fleetctl's own directory,
+prints the public half, and authorizes nothing. It is never run for you — not by
+the installer, not by another verb. Point `FLEET_KEY` at a key you already have,
+or on a workstation let `~/.ssh` handle it, and `keygen` never needs to exist.
+
+Authorizing the key stays a human action in the router GUI, on purpose:
+authorized-keys is the one setting that can lock you out of your own mesh, and
+the GUI is where the password escape hatch still works.
+
+## Using fleetctl from your own addon
+
+fleetctl is designed to be **depended on**, not vendored. Copying the fan-out
+code into your addon recreates the exact problem this repo exists to solve — N
+copies of security-sensitive SSH orchestration, each drifting. Depend on the
+**CLI contract** instead.
+
+**Detect it, don't bundle it:**
+
+```sh
+FLEETCTL=$(which fleetctl 2>/dev/null || echo /jffs/scripts/fleetctl)
+if [ -x "$FLEETCTL" ]; then
+  "$FLEETCTL" --porcelain run '/jffs/scripts/roamctl health'
+else
+  echo "Mesh commands need fleetctl:"
+  echo "  curl -fsSL https://raw.githubusercontent.com/deviationist/asuswrt-merlin-fleetctl/main/install.sh | sh"
+fi
+```
+
+**`--porcelain` is a stable contract.** One tab-separated row per node:
+
+```
+fleetctl<TAB>node<TAB>OK|FAIL|SKIPPED<TAB>reason
+```
+
+Columns are never reordered or repurposed; anything new is appended. The exit
+code is still non-zero if any node failed, so you can use either signal:
+
+```sh
+"$FLEETCTL" --porcelain install "$MY_INSTALLER" | while IFS="$(printf '\t')" read -r _ node state reason; do
+  [ "$state" = "FAIL" ] && echo "$node did not take the update: $reason"
+done
+```
+
+**Library mode**, if you want fleetctl's plumbing rather than its verbs:
+
+```sh
+FLEETCTL_LIB=1 . /jffs/scripts/fleetctl     # loads, runs nothing
+
+for spec in $(fleet_list); do
+  fleet_spec "$spec"                        # -> SPEC_HOST SPEC_PORT SPEC_USER SPEC_MAC SPEC_NAME SPEC_LOCAL
+  fleet_probe || continue                   # -> P_MODEL P_JFFS P_DIR P_MACS P_REASON
+  fleet_eligible && fleet_exec 60 'my command'
+done
+```
+
+The `fleet_*` functions are the stable surface: `fleet_version`,
+`fleet_platform`, `fleet_list`, `fleet_spec`, `fleet_probe`, `fleet_eligible`,
+`fleet_gate`, `fleet_exec`. Underscore-prefixed internals are not — they change
+between releases. Gate on `fleet_version` if you need a specific behaviour.
+
+Prefer the CLI unless you have a concrete reason: it is version-tolerant, and it
+keeps the fan-out safety model (gates, timeouts, summary, exit code) working for
+you rather than something you have to reimplement.
 
 ## Password login (supported reluctantly, discouraged loudly)
 
@@ -316,9 +452,11 @@ are done with it; AiMesh propagates the removal to the nodes.
 
 ## Status
 
-v0.1.0. Fully exercised by 101 offline tests (`sh scripts/fleetctl.test.sh`) and
-validated on a dev mesh (RT-BE92U 3006 controller + stock RP-BE58 node). The
-`install` happy path needs a **Merlin** node to be validated in the field.
+v0.2.0. Exercised by 143 offline tests (`sh scripts/fleetctl.test.sh`, and
+again under `dash`) and validated against a dev mesh (RT-BE92U 3006 controller +
+stock RP-BE58 node): discovery parsing, key auth into a node, the eligibility
+skip path and the MAC-pin check are all confirmed on real hardware. The
+`install` happy path still needs a **Merlin** node to be validated in the field.
 See `PLAN.md` for what is verified vs. still open, and `AGENTS.md` if you are
 contributing.
 
