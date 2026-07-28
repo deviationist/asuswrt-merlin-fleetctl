@@ -485,6 +485,11 @@ addon, it publishes the contract an installer must satisfy to be
    fleet-wide rollout back, so take `uninstall` as `$1`.
 5. **Ends with a verifiable health verdict** on stdout, non-zero exit on
    failure. Print it; fleetctl shows it per node.
+6. **Never fans out itself.** If your addon grows a mesh feature, put it in an
+   operator-invoked command, never in the installer's execution path — an
+   installer that calls fleetctl would fan out again from every node it lands
+   on. fleetctl exports `FLEETCTL_FANOUT=1` into everything it runs so you can
+   detect it and stand down, and refuses nested fan-out itself if you don't.
 
 [flowcache-doctor](https://github.com/deviationist/asuswrt-merlin-flowcache-doctor)
 is the real-world reference implementation. This repo also ships a deliberately
@@ -605,7 +610,7 @@ are done with it; AiMesh propagates the removal to the nodes.
 
 ## Status
 
-v0.3.0. Exercised by 201 offline tests (`sh scripts/fleetctl.test.sh`, and again
+v0.3.1. Exercised by 207 offline tests (`sh scripts/fleetctl.test.sh`, and again
 under `dash`), and **every verb has now run on a production router** — an
 RT-BE92U 3006 controller with a stock RP-BE58 node: `discover`, `nodes`, `run`,
 `install`, `install … uninstall`, `health`, the consent gate, the

@@ -135,6 +135,16 @@ Related invariants:
   Without it, a child that exits just as the sleeper wakes can have its pid
   recycled and something unrelated killed — unacceptable on production kit.
 
+## Never let a fan-out nest
+
+fleetctl exports `FLEETCTL_FANOUT=1` into every command it runs on a target, and
+refuses `run`/`push`/`install` when it finds that variable already set. An addon
+installer that shells back into fleetctl would otherwise fan out again from
+every node it lands on — exponential, as root, across someone's mesh. Read-only
+verbs stay available when nested; `FLEETCTL_ALLOW_NESTED=1` is the deliberate
+override. Keep both halves: the marker (so a well-behaved consumer can stand
+down) and the refusal (so a careless one still cannot recurse).
+
 ## Public contracts (breaking these breaks consumers)
 
 fleetctl is meant to be **depended on, not vendored** — addons like

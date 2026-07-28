@@ -31,7 +31,7 @@
 #     `install <url> uninstall`).
 #
 # Usage: fleetctl [global flags] <verb> [args]   — see the bottom of this file.
-VERSION=0.3.0
+VERSION=0.3.1
 TAG=fleetctl
 REPO_RAW="https://raw.githubusercontent.com/deviationist/asuswrt-merlin-fleetctl/main"
 UPDATE_TMP=/tmp/fleetctl.update.sh          # transient installer copy for 'update' (RAM)
@@ -92,6 +92,15 @@ if [ "$PLATFORM" = "router" ]; then
   [ -n "$FLEET_CONTROLLER" ] || FLEET_CONTROLLER=self
 fi
 [ -n "$FLEET_PORT" ] || FLEET_PORT=22
+
+# Recursion guard. fleetctl exports FLEETCTL_FANOUT=1 into every command it
+# runs on a target, so if we find it set, we are running INSIDE someone's
+# fan-out — an addon installer that shells out to fleetctl, most likely. Fanning
+# out again from there multiplies across the mesh at every hop, as root. The
+# read-only verbs stay available (a consumer inspecting its own fleet is fine);
+# only the verbs that reach other units are refused.
+NESTED=0
+[ "${FLEETCTL_FANOUT:-0}" = "1" ] && NESTED=1
 
 # --- global flags (parsed by the dispatcher at the bottom) ---
 DRY_RUN=0
@@ -539,6 +548,18 @@ _pin_matches() {
 # Unattended (no TTY — cron, or a consuming addon) an unconfirmed fan-out is
 # REFUSED rather than assumed: --yes must be explicit. That way "it ran while
 # nobody was looking" is always something the caller opted into.
+_no_recursion() {
+  [ "$NESTED" = "1" ] || return 0
+  [ "${FLEETCTL_ALLOW_NESTED:-0}" = "1" ] && { warn "nested fan-out permitted by FLEETCTL_ALLOW_NESTED=1 — you are on your own"; return 0; }
+  die "refusing to fan out from inside another fan-out.
+FLEETCTL_FANOUT is set, which means this fleetctl was started by something
+fleetctl is already running on a target — an addon installer calling back into
+fleetctl, most likely. Fanning out again multiplies across the mesh at every
+hop. Mesh orchestration belongs in an operator-invoked command, never in an
+installer's execution path. Override with FLEETCTL_ALLOW_NESTED=1 if you are
+certain."
+}
+
 _confirm_fanout() {
   [ "$DRY_RUN" = "1" ] && return 0          # dry runs change nothing
   echo
@@ -926,6 +947,7 @@ cmd_nodes() {
 }
 
 cmd_run() {
+  _no_recursion
   [ -n "$1" ] || die "usage: fleetctl run <command...>"
   _nodes_or_die
   _lock
@@ -951,7 +973,7 @@ cmd_run() {
     # Buffered per node (in /tmp = RAM, never /jffs = flash): a pipeline would
     # hide the remote exit status, and busybox sh has no PIPESTATUS. Serial and
     # deterministic — meshes are 2-4 units, and the router is also routing.
-    _run_on "$FLEET_RUN_TIMEOUT" "$cmdstr" > "$out" 2>&1; s=$?
+    _run_on "$FLEET_RUN_TIMEOUT" "FLEETCTL_FANOUT=1; export FLEETCTL_FANOUT; $cmdstr" > "$out" 2>&1; s=$?
     [ -s "$out" ] && sed "s/^/[$SPEC_NAME] /" "$out"
     if [ "$TIMED_OUT" = "1" ]; then
       _result "$SPEC_NAME" FAIL "timed out after ${FLEET_RUN_TIMEOUT}s (FLEET_RUN_TIMEOUT)"
@@ -965,6 +987,7 @@ cmd_run() {
 }
 
 cmd_push() {
+  _no_recursion
   src=$1; dest=$2
   [ -n "$src" ] && [ -n "$dest" ] || die "usage: fleetctl push <local-file> <remote-path>"
   [ -f "$src" ] || die "no such file: $src"
@@ -1019,6 +1042,7 @@ cmd_push() {
 }
 
 cmd_install() {
+  _no_recursion
   url=$1; shift
   [ -n "$url" ] || die "usage: fleetctl install <installer-url> [args...]"
   case "$url" in
@@ -1074,7 +1098,13 @@ cmd_install() {
       _result "$SPEC_NAME" SKIPPED "dry run"
       continue
     fi
-    rcmd="t=/tmp/fleetctl-install.\$\$.sh; curl -fsSL '$url' -o \"\$t\" || { echo 'fleetctl: installer download failed (does this node have internet access?)'; exit 90; }; sh \"\$t\" $args; _rc=\$?; rm -f \"\$t\"; exit \$_rc"
+    # FLEETCTL_FANOUT marks the installer's environment as "already inside a
+    # fan-out". An addon that grows a mesh feature can check it and stand down;
+    # fleetctl itself refuses on it (see the recursion guard at the top), so an
+    # addon that ignores the marker still cannot recurse. Without this, an
+    # installer that calls fleetctl would fan out from every node it lands on —
+    # exponential, as root.
+    rcmd="FLEETCTL_FANOUT=1; export FLEETCTL_FANOUT; t=/tmp/fleetctl-install.\$\$.sh; curl -fsSL '$url' -o \"\$t\" || { echo 'fleetctl: installer download failed (does this node have internet access?)'; exit 90; }; sh \"\$t\" $args; _rc=\$?; rm -f \"\$t\"; exit \$_rc"
     _run_on "$FLEET_INSTALL_TIMEOUT" "$rcmd" > "$TMPBASE.out" 2>&1; s=$?
     # NEVER reduce a node to a checkmark: an addon can install cleanly, exit 0,
     # and still be silently inert — the installer's own tail is the only place

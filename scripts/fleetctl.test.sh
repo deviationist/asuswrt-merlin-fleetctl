@@ -537,6 +537,27 @@ reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2,mac=AA:BB:CC
 out=$(run --dry-run push "$TMP/payload" /jffs/scripts/payload 2>&1)
 has  "dry-run push: distinguishes create/overwrite" "$out" "would "
 
+# === recursion guard ========================================================
+echo "-- recursion guard"
+# An addon installer that shells back into fleetctl would fan out again from
+# every node it lands on — exponential, as root. fleetctl marks the environment
+# of everything it runs, and refuses to act on that marker.
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2,mac=AA:BB:CC:DD:EE:02"'
+out=$(FLEETCTL_FANOUT=1 "$SH" "$FLEETCTL" --yes install https://example.invalid/x.sh 2>&1); rc=$?
+has  "nested install refused"                  "$out" "refusing to fan out from inside another fan-out"
+nonzero "nested install exits non-zero"        "$rc"
+out=$(FLEETCTL_FANOUT=1 "$SH" "$FLEETCTL" run uptime 2>&1); rc=$?
+has  "nested run refused"                      "$out" "refusing to fan out from inside another fan-out"
+out=$(FLEETCTL_FANOUT=1 "$SH" "$FLEETCTL" nodes 2>&1)
+has  "read-only verbs still work when nested"  "$out" "merlin: yes"
+out=$(FLEETCTL_FANOUT=1 FLEETCTL_ALLOW_NESTED=1 "$SH" "$FLEETCTL" run uptime 2>&1)
+has  "explicit override is honoured"           "$out" "output-from-192.168.1.2"
+
+# the marker must actually reach the target, or a consumer cannot detect it
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2,mac=AA:BB:CC:DD:EE:02"'
+run --yes install https://example.invalid/x.sh >/dev/null 2>&1
+has  "marker is exported to the installer"     "$(cat "$TMP/installcmd-192.168.1.2")" "FLEETCTL_FANOUT=1"
+
 # === consumer integration (addons depending on fleetctl) ====================
 echo "-- consumer integration"
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2 192.168.1.9"'
