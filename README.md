@@ -477,7 +477,18 @@ addon, it publishes the contract an installer must satisfy to be
    failure. Print it; fleetctl shows it per node.
 
 [flowcache-doctor](https://github.com/deviationist/asuswrt-merlin-flowcache-doctor)
-is the reference implementation.
+is the real-world reference implementation. This repo also ships a deliberately
+inert one, [`extras/canary.sh`](extras/canary.sh), which satisfies all five
+points and changes nothing that survives a reboot — it exists so you can
+exercise `install` end to end against production kit without installing
+anything:
+
+```sh
+CANARY=https://raw.githubusercontent.com/deviationist/asuswrt-merlin-fleetctl/main/extras/canary.sh
+fleetctl --dry-run install "$CANARY"     # see the plan
+fleetctl --yes     install "$CANARY"     # run it: writes only /tmp/fleetctl-canary
+fleetctl --yes     install "$CANARY" uninstall   # and roll it back
+```
 
 ## Worked example: flowcache-doctor across a mesh
 

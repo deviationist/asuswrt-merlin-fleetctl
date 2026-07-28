@@ -433,7 +433,12 @@ _probe() {
     elif grep -qi 'denied\|authentication' "$_err" 2>/dev/null; then
       P_REASON="SSH auth failed (is the key pasted into the router GUI's SSH authentication key field yet?)"
     else
-      P_REASON="unreachable: $(head -1 "$_err" 2>/dev/null | cut -c1-120)"
+      # Flatten ALL of stderr into one line rather than taking the first: on a
+      # real auth failure dbclient's first line is a bare "dbclient: " and the
+      # actual message follows, so head -1 produced the useless
+      # "unreachable: dbclient:" seen on hardware 2026-07-28.
+      _msg=$(tr '\n' ' ' < "$_err" 2>/dev/null | tr -s ' ' | sed 's/^ *//; s/ *$//' | cut -c1-160)
+      P_REASON="unreachable: ${_msg:-no error text from the SSH client}"
       [ "$_rc" = "0" ] && P_REASON="connected, but the probe produced no answer (is this an ASUS unit?)"
     fi
     return 1
@@ -789,12 +794,12 @@ EOF
     tag=""; [ "$role" = "1" ] && tag=" [controller]"
     if _probe; then
       if _eligible; then
-        printf '  %-16s %-14s %-10s auth: ok    merlin: yes  (run + install)%s\n' "$shown" "$label" "$P_MODEL" "$tag"
+        printf '  %-19s %-13s %-10s auth: ok    merlin: yes  (run + install)%s\n' "$shown" "$label" "$P_MODEL" "$tag"
       else
-        printf '  %-16s %-14s %-10s auth: ok    merlin: no   (run only)%s\n' "$shown" "$label" "$P_MODEL" "$tag"
+        printf '  %-19s %-13s %-10s auth: ok    merlin: no   (run only)%s\n' "$shown" "$label" "$P_MODEL" "$tag"
       fi
     else
-      printf '  %-16s %-14s %-10s auth: FAIL  %s\n' "$shown" "$label" "-" "$(echo "$P_REASON" | cut -c1-60)"
+      printf '  %-19s %-13s %-10s auth: FAIL  %s\n' "$shown" "$label" "-" "$(echo "$P_REASON" | cut -c1-70)"
     fi
     specline="$specline$spec "
   done <<EOF
