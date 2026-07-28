@@ -96,6 +96,35 @@ parseable) and loudly, because silently acting on the controller when someone
 MEANT to reach their mesh (typo'd conf, wrong file) would be a nasty surprise.
 Off-router there is no fallback: a workstation is not an install target.
 
+## fleetctl is inert; keep it that way
+
+Users' routers are production kit and usually their only one. fleetctl's
+central safety property is that **it does nothing unless invoked**: no daemon,
+no `cru` entry, no `services-start` hook, no firewall rule, no `nvram set`, no
+`service restart`. This is mechanically checkable and there is a line in the
+README inviting users to check it:
+
+    grep -nE 'cru |services-start|firewall-start|nvram set|service restart' scripts/fleetctl install.sh
+
+If you add a background component you break the property that makes this tool
+safe to put on someone's only router — and you inherit every daemon-lifecycle
+hazard in flowcache-doctor's AGENTS.md. Don't, unless the owner asks for it
+explicitly.
+
+Related invariants:
+- **Consent before change.** `install` and `push` call `_confirm_fanout`: TTY
+  prompt, or explicit `--yes`. **No TTY and no `--yes` = refuse**, never assume
+  — that is what stops a cron-driven or addon-driven fan-out nobody watched.
+  `run` is deliberately ungated (the operator typed the command; prompt fatigue
+  devalues the prompts that matter). Dry runs never prompt.
+- **Every path is env-overridable** (`FLEETCTL_CONF`, `FLEETCTL_HOME`,
+  `FLEETCTL_LOCK`, `FLEETCTL_JFFS`, `FLEETCTL_PLATFORM`) so the tool can be
+  trialled entirely from `/tmp` with zero flash writes. Keep it that way: it is
+  the only honest way to meet a production router.
+- **The timeout watchdog re-checks `/proc/<pid>/cmdline`** before signalling.
+  Without it, a child that exits just as the sleeper wakes can have its pid
+  recycled and something unrelated killed — unacceptable on production kit.
+
 ## Public contracts (breaking these breaks consumers)
 
 fleetctl is meant to be **depended on, not vendored** — addons like

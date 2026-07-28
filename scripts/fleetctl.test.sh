@@ -243,14 +243,14 @@ out=$(run run 'sleep 4' 2>&1)
 has  "self: the watchdog applies locally too" "$out" "timed out after 1s"
 
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="self"'
-out=$(run install https://example.invalid/addon.sh 2>&1); rc=$?
+out=$(run --yes install https://example.invalid/addon.sh 2>&1); rc=$?
 has  "self: install runs locally"             "$out" "Installed and HEALING"
 is   "self: install needs no mac pin"         "$rc" "0"
 
 # the machine stops looking like an ASUS unit -> mutating verbs must refuse
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="self"'
 sed -i.bak '/^productid=/d' "$NVRAM_STATE"
-out=$(run install https://example.invalid/addon.sh 2>&1); rc=$?
+out=$(run --yes install https://example.invalid/addon.sh 2>&1); rc=$?
 has  "self: refused when this is not an ASUS unit" "$out" "this machine is not an ASUS router"
 nonzero "self: non-router refusal exits non-zero" "$rc"
 out=$(run run 'echo STILL-FINE' 2>&1)
@@ -258,7 +258,7 @@ has  "self: 'run' still works off-router"     "$out" "[self] STILL-FINE"
 
 # installing fleetctl onto itself would rewrite the running script
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="self 192.168.1.2,mac=AA:BB:CC:DD:EE:02"'
-out=$(run install https://example.invalid/asuswrt-merlin-fleetctl/main/install.sh 2>&1); rc=$?
+out=$(run --yes install https://example.invalid/asuswrt-merlin-fleetctl/main/install.sh 2>&1); rc=$?
 has  "self: refuses to install fleetctl over itself" "$out" "installing over a running script is undefined"
 has  "self: points at 'update' instead"       "$out" "fleetctl update"
 nonzero "self: self-install refusal exits non-zero" "$rc"
@@ -386,42 +386,42 @@ has  "lock: reclaims a stale lock"            "$out" "output-from-192.168.1.2"
 # === install ================================================================
 echo "-- install"
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2,mac=AA:BB:CC:DD:EE:02"'
-out=$(run install https://example.invalid/install.sh 2>&1); rc=$?
+out=$(run --yes install https://example.invalid/install.sh 2>&1); rc=$?
 has  "install: surfaces the installer's own output" "$out" "Installed and HEALING"
 has  "install: warns that exit 0 can still be inert" "$out" "inert configuration"
 is   "install: success exits zero"            "$rc" "0"
 
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2,mac=AA:BB:CC:DD:EE:02"'
-run install https://example.invalid/install.sh uninstall >/dev/null 2>&1
+run --yes install https://example.invalid/install.sh uninstall >/dev/null 2>&1
 has  "install: passes args through (rollback path)" "$(cat "$TMP/installcmd-192.168.1.2")" "uninstall"
 
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2"'
-out=$(run install https://example.invalid/install.sh 2>&1); rc=$?
+out=$(run --yes install https://example.invalid/install.sh 2>&1); rc=$?
 has  "install: refuses an unpinned node"      "$out" "no MAC pin"
 nonzero "install: unpinned refusal exits non-zero" "$rc"
-out=$(run --allow-unpinned install https://example.invalid/install.sh 2>&1)
+out=$(run --yes --allow-unpinned install https://example.invalid/install.sh 2>&1)
 has  "install: --allow-unpinned overrides"    "$out" "Installed and HEALING"
 
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2,mac=AA:BB:CC:DD:EE:99"'
-out=$(run install https://example.invalid/install.sh 2>&1); rc=$?
+out=$(run --yes install https://example.invalid/install.sh 2>&1); rc=$?
 has  "install: refuses a pin mismatch"        "$out" "does not match"
 has  "install: pin mismatch suggests re-discovery" "$out" "fleetctl discover"
 nonzero "install: pin mismatch exits non-zero" "$rc"
 
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.3,mac=AA:BB:CC:DD:EE:03"'
-out=$(run install https://example.invalid/install.sh 2>&1); rc=$?
+out=$(run --yes install https://example.invalid/install.sh 2>&1); rc=$?
 has  "install: skips an ineligible node"      "$out" "not Merlin-eligible"
 has  "install: ineligible is SKIPPED not FAIL" "$out" "SKIPPED  192.168.1.3"
 is   "install: a skip alone is not a failure" "$rc" "0"
 
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2,mac=AA:BB:CC:DD:EE:02"'
 host_fixture 192.168.1.2 ok RT-NODE-A 1 yes "AA:BB:CC:DD:EE:02," 90 0
-out=$(run install https://example.invalid/install.sh 2>&1); rc=$?
+out=$(run --yes install https://example.invalid/install.sh 2>&1); rc=$?
 has  "install: download failure is distinguished" "$out" "could not download the installer"
 nonzero "install: download failure exits non-zero" "$rc"
 
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2,mac=AA:BB:CC:DD:EE:02"'
-out=$(run install ftp://example.invalid/install.sh 2>&1); rc=$?
+out=$(run --yes install ftp://example.invalid/install.sh 2>&1); rc=$?
 has  "install: rejects a non-http URL"        "$out" "must be an http(s) URL"
 nonzero "install: bad URL exits non-zero"     "$rc"
 
@@ -434,26 +434,68 @@ hasnt "install --dry-run: installs nothing"   "$out" "Installed and HEALING"
 echo "-- push"
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2,mac=AA:BB:CC:DD:EE:02"'
 echo "PAYLOAD-CONTENT" > "$TMP/payload"
-out=$(run push "$TMP/payload" /jffs/scripts/payload 2>&1); rc=$?
+out=$(run --yes push "$TMP/payload" /jffs/scripts/payload 2>&1); rc=$?
 is   "push: content lands on the node"        "$(cat "$TMP/pushed-192.168.1.2" 2>/dev/null)" "PAYLOAD-CONTENT"
 has  "push: reports the destination"          "$out" "wrote /jffs/scripts/payload"
 is   "push: success exits zero"               "$rc" "0"
 has  "push: writes atomically via temp+mv"    "$(cat "$TMP/sshlog")" ".fleetctl."
 
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2,mac=AA:BB:CC:DD:EE:02"'
-out=$(run push "$TMP/payload" relative/path 2>&1); rc=$?
+out=$(run --yes push "$TMP/payload" relative/path 2>&1); rc=$?
 has  "push: refuses a relative destination"   "$out" "must be absolute"
 nonzero "push: relative destination exits non-zero" "$rc"
 
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2,mac=AA:BB:CC:DD:EE:02"'
-out=$(run push "$TMP/does-not-exist" /jffs/scripts/x 2>&1); rc=$?
+out=$(run --yes push "$TMP/does-not-exist" /jffs/scripts/x 2>&1); rc=$?
 has  "push: refuses a missing local file"     "$out" "no such file"
 nonzero "push: missing local file exits non-zero" "$rc"
 
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.3,mac=AA:BB:CC:DD:EE:03"'
-out=$(run push "$TMP/payload" /jffs/scripts/payload 2>&1)
+out=$(run --yes push "$TMP/payload" /jffs/scripts/payload 2>&1)
 has  "push: skips an ineligible node"         "$out" "not Merlin-eligible"
 is   "push: nothing written to a skipped node" "$([ -f "$TMP/pushed-192.168.1.3" ] && echo y)" ""
+
+# === production safety: consent before changing a unit ======================
+echo "-- consent gate"
+# These are production routers, often the only one the owner has. `install` runs
+# someone else's code as root; `push` overwrites files. Unattended, both must
+# refuse rather than assume.
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2,mac=AA:BB:CC:DD:EE:02"'
+out=$(run install https://example.invalid/addon.sh 2>&1); rc=$?
+has  "consent: unattended install is refused"   "$out" "refusing to fan out unattended"
+has  "consent: names the escape hatch"          "$out" "--yes"
+has  "consent: suggests previewing first"       "$out" "--dry-run"
+hasnt "consent: nothing was installed"          "$out" "Installed and HEALING"
+nonzero "consent: refusal exits non-zero"       "$rc"
+
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2,mac=AA:BB:CC:DD:EE:02"'
+out=$(run --yes install https://example.invalid/addon.sh 2>&1)
+has  "consent: --yes states the plan"           "$out" "About to download and RUN this installer as root"
+has  "consent: --yes proceeds"                  "$out" "Installed and HEALING"
+
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2,mac=AA:BB:CC:DD:EE:02"'
+echo "PAYLOAD-CONTENT" > "$TMP/payload"
+out=$(run push "$TMP/payload" /jffs/scripts/payload 2>&1); rc=$?
+has  "consent: unattended push is refused"      "$out" "refusing to fan out unattended"
+is   "consent: nothing was written"             "$([ -f "$TMP/pushed-192.168.1.2" ] && echo y)" ""
+nonzero "consent: push refusal exits non-zero"  "$rc"
+
+# a dry run changes nothing, so it must never demand consent
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2,mac=AA:BB:CC:DD:EE:02"'
+out=$(run --dry-run install https://example.invalid/addon.sh 2>&1); rc=$?
+hasnt "consent: dry run needs no --yes"         "$out" "refusing to fan out"
+is   "consent: dry run exits zero"              "$rc" "0"
+
+# `run` is deliberately NOT gated — reflexive y-pressing devalues real prompts
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2"'
+out=$(run run uptime 2>&1); rc=$?
+hasnt "consent: 'run' is not gated"             "$out" "refusing to fan out"
+is   "consent: 'run' still works unattended"    "$rc" "0"
+
+# a prod operator needs to know whether a push replaces something
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2,mac=AA:BB:CC:DD:EE:02"'
+out=$(run --dry-run push "$TMP/payload" /jffs/scripts/payload 2>&1)
+has  "dry-run push: distinguishes create/overwrite" "$out" "would "
 
 # === consumer integration (addons depending on fleetctl) ====================
 echo "-- consumer integration"
@@ -465,7 +507,7 @@ hasnt "porcelain: no decorative summary box"    "$out" "--- summary ---"
 nonzero "porcelain: exit code still reflects failure" "$rc"
 
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.3,mac=AA:BB:CC:DD:EE:03"'
-out=$(run --porcelain install https://example.invalid/addon.sh 2>&1)
+out=$(run --yes --porcelain install https://example.invalid/addon.sh 2>&1)
 has  "porcelain: SKIPPED is machine-readable"   "$out" "$(printf 'fleetctl\t192.168.1.3\tSKIPPED')"
 
 # `nodes` is the fleet-state query a consumer most wants to parse
@@ -490,7 +532,7 @@ echo "-- eligibility diagnosis"
 # jffs2_scripts is MERLIN-ONLY: absent on stock firmware, not "0". The two cases
 # need different advice — one is a firmware flash, the other is a GUI toggle.
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.3,mac=AA:BB:CC:DD:EE:03"'
-out=$(run install https://example.invalid/addon.sh 2>&1)
+out=$(run --yes install https://example.invalid/addon.sh 2>&1)
 has  "stock node: diagnosed as not-Merlin"     "$out" "is not running Asuswrt-Merlin"
 has  "stock node: warns a build may not exist" "$out" "no Merlin build"
 hasnt "stock node: does NOT suggest a GUI toggle it lacks" "$out" "Enable JFFS custom scripts and configs"
@@ -498,14 +540,14 @@ hasnt "stock node: does NOT suggest a GUI toggle it lacks" "$out" "Enable JFFS c
 # Merlin with the setting off -> that IS the GUI toggle case
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.3,mac=AA:BB:CC:DD:EE:03"'
 host_fixture 192.168.1.3 ok RT-NODE-C 0 no "AA:BB:CC:DD:EE:03," 0 0
-out=$(run install https://example.invalid/addon.sh 2>&1)
+out=$(run --yes install https://example.invalid/addon.sh 2>&1)
 has  "scripts-off node: points at the GUI toggle" "$out" "Enable JFFS custom scripts and configs"
 hasnt "scripts-off node: not called non-Merlin" "$out" "is not running Asuswrt-Merlin"
 
 # Merlin, scripts on, but the directory is missing -> a third, distinct case
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.3,mac=AA:BB:CC:DD:EE:03"'
 host_fixture 192.168.1.3 ok RT-NODE-D 1 no "AA:BB:CC:DD:EE:03," 0 0
-out=$(run install https://example.invalid/addon.sh 2>&1)
+out=$(run --yes install https://example.invalid/addon.sh 2>&1)
 has  "no-scripts-dir node: reported distinctly" "$out" "but no"
 
 # === single-device / passthrough ============================================
@@ -519,7 +561,7 @@ has  "single: says so loudly"                  "$out" "single-device mode"
 is   "single: exits zero"                      "$rc" "0"
 
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES=""'
-out=$(runp router install https://example.invalid/addon.sh 2>&1); rc=$?
+out=$(runp router --yes install https://example.invalid/addon.sh 2>&1); rc=$?
 has  "single: install works with no config"    "$out" "Installed and HEALING"
 is   "single: install exits zero"              "$rc" "0"
 

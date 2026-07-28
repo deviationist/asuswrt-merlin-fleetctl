@@ -282,6 +282,70 @@ Stated non-goals: fleetctl **never** writes `sshd_authkeys` or any AiMesh-synced
 nvram, and **never** restarts `cfg_client`/`cfg_server`. It must not be able to
 break your mesh.
 
+## Running it against production
+
+Home routers are production kit, and most people have exactly one. fleetctl is
+built on that assumption.
+
+**It is inert unless you invoke it.** No daemon, no cron entry, no
+`services-start` hook, no firewall rule, no nvram write — nothing that can act
+at 3am. Between commands, fleetctl is a file. (Contrast an addon like
+flowcache-doctor, which legitimately installs a poller, a watchdog and a boot
+hook.) Grep for it if you like:
+
+```sh
+grep -nE 'cru |services-start|firewall-start|nvram set|service restart' scripts/fleetctl install.sh
+# no matches
+```
+
+**Everything it writes, exhaustively:**
+
+| Path | When | Notes |
+|---|---|---|
+| `<confdir>/fleetctl` | install | the tool itself |
+| `<confdir>/fleetctl.conf` | install, once | never overwritten afterwards |
+| `<confdir>/fleetctl.key{,.pub}` | only if you run `keygen` | never automatic |
+| `<confdir>/fleetctl.d/.ssh/known_hosts` | first connection, router only | a few hundred bytes |
+| `/jffs/configs/profile.add` | install, one appended line | skip with `install.sh --no-path` |
+| `/tmp/fleetctl.*` | per run | RAM; buffered output, lock, markers |
+
+**Try it with zero flash writes.** Every path is env-overridable, so fleetctl
+can run entirely from RAM and vanish on reboot — the right way to meet a
+production router for the first time:
+
+```sh
+# from a checkout, on your workstation
+COPYFILE_DISABLE=1 tar cf - -C scripts fleetctl |
+  ssh router 'tar xf - -C /tmp && chmod 755 /tmp/fleetctl'
+ssh router 'printf %s\n "FLEET_KEY=/tmp/fleetctl.key" > /tmp/fleetctl.conf'
+ssh router 'FLEETCTL_CONF=/tmp/fleetctl.conf FLEETCTL_HOME=/tmp/fleetctl.d \
+            FLEETCTL_LOCK=/tmp/fleetctl.lock /tmp/fleetctl health'
+```
+
+`COPYFILE_DISABLE=1` matters on macOS: BSD tar otherwise packs an AppleDouble
+`._fleetctl` sidecar onto the router's flash alongside the real file.
+
+**Or do not touch the router at all** — run fleetctl from your workstation
+against the mesh. `health`, `nodes`, `discover`, and any `--dry-run` are
+strictly read-only on the targets (`nvram get` and a directory test), so they
+are safe to point at live kit.
+
+**Consent before change.** `install` and `push` state the plan and require
+agreement — a TTY confirmation, or an explicit `--yes`. With no terminal (cron,
+a consuming addon) an unconfirmed fan-out is **refused**, not assumed. `run` is
+deliberately not gated: you typed that command yourself, and prompts you always
+say yes to are worse than no prompts.
+
+```
+About to download and RUN this installer as root: https://…/install.sh
+  on: 192.168.1.1 192.168.1.2
+  as: root (that is what SSH to these units gives you)
+  Proceed? [y/N]
+```
+
+**Order of operations on a router you cannot afford to break:**
+`health` → `discover` → `nodes` → `--dry-run install` → `--yes install`.
+
 ## What fleetctl does not touch
 
 fleetctl **consumes** credentials; it does not provision, install or manage

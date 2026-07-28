@@ -98,6 +98,7 @@ DRY_RUN=0
 INCLUDE_SELF=0
 ALLOW_UNPINNED=0
 PORCELAIN=0
+ASSUME_YES=0
 
 # Per-node identity + eligibility, in ONE round trip. The __fleetprobe__ token
 # marks OUR line so a login banner can't be mistaken for the answer. An empty
@@ -330,7 +331,19 @@ _with_timeout() {
   # Without this redirect the watchdog holds the pipe for its full duration, so
   # a call that already succeeded still blocks for the whole timeout (a 20 s
   # stall on every `discover`). Caught by running the suite under dash.
-  ( sleep "$_cap"; kill "$_cpid" 2>/dev/null && : > "$_mark" ) >/dev/null 2>&1 &
+  #
+  # PID-REUSE GUARD: there is a narrow window where the child exits just as the
+  # sleeper wakes, the kernel recycles its pid, and the sleeper kills whatever
+  # inherited it. On a production router that could be any process. So the
+  # sleeper re-checks /proc/<pid>/cmdline still looks like the thing we
+  # launched before signalling. Where /proc is absent the check is skipped —
+  # the router has /proc, which is where this matters.
+  _what=$1
+  ( sleep "$_cap"
+    if [ -r "/proc/$_cpid/cmdline" ]; then
+      tr '\0' ' ' < "/proc/$_cpid/cmdline" 2>/dev/null | grep -q "$_what" || exit 0
+    fi
+    kill "$_cpid" 2>/dev/null && : > "$_mark" ) >/dev/null 2>&1 &
   _wpid=$!
   wait "$_cpid"; _rc=$?
   kill "$_wpid" 2>/dev/null
@@ -490,6 +503,41 @@ _pin_matches() {
     [ "$m" = "$SPEC_MAC" ] && return 0
   done
   return 1
+}
+
+# --- confirmation gate for the verbs that change a unit ---------------------
+# These routers are production kit for the people who own them, and often the
+# only one they have — there is no staging mesh. `install` runs SOMEONE ELSE'S
+# code as root on every eligible unit; `push` overwrites files. Both therefore
+# state the plan and require agreement.
+#
+# `run` is deliberately NOT gated: the operator typed that command themselves,
+# they see it echoed, and every node's result is summarised. Prompting there
+# would train people to hit `y` reflexively, which makes the prompts that do
+# matter worthless.
+#
+# Unattended (no TTY — cron, or a consuming addon) an unconfirmed fan-out is
+# REFUSED rather than assumed: --yes must be explicit. That way "it ran while
+# nobody was looking" is always something the caller opted into.
+_confirm_fanout() {
+  [ "$DRY_RUN" = "1" ] && return 0          # dry runs change nothing
+  echo
+  echo "About to $1"
+  echo "  on: $(echo $FLEET_NODES | tr ' ' '\n' | sed 's/,.*//' | tr '\n' ' ')"
+  echo "  as: root (that is what SSH to these units gives you)"
+  [ "$ASSUME_YES" = "1" ] && { echo "  --yes given, proceeding."; return 0; }
+  if ! _have_tty; then
+    die "refusing to fan out unattended. There is no terminal to confirm at
+(cron? a script? a consuming addon?), so pass --yes if this is intended:
+  fleetctl --yes $VERB ...
+Or preview it safely first with --dry-run."
+  fi
+  printf '  Proceed? [y/N] ' >&2
+  read -r _ans < /dev/tty
+  case "$_ans" in
+    y|Y|yes|YES) echo ;;
+    *) die "aborted by operator — nothing was changed." ;;
+  esac
 }
 
 # --- per-node result summary ------------------------------------------------
@@ -688,9 +736,15 @@ cmd_discover() {
       else
         die "could not use the default gateway ($_gw) as the AiMesh controller: $AUTO_REASON
 
-Set it explicitly in $CONF once you know which unit it is:
-  FLEET_CONTROLLER=\"$_gw\"              # or a Host alias from ~/.ssh/config
-If SSH auth is the problem, authorize your key on the router first (see README)."
+If you normally reach this router through an SSH ALIAS (a Host block in
+~/.ssh/config supplying the user and key), auto-detection cannot see that — it
+only has the bare address. Name the alias instead:
+  FLEET_CONTROLLER=\"router\"             # whatever your Host block is called
+or set the address plus a user:
+  FLEET_CONTROLLER=\"$_gw\"
+  FLEET_USER=\"<router admin username>\"
+Either goes in $CONF. If SSH auth itself is the problem, authorize your key on
+the router first (see README)."
       fi
     else
       die "discovery asks the AiMesh controller, and this machine is not one.
@@ -739,6 +793,22 @@ Discovery is only a convenience — you can also just write FLEET_NODES by hand.
   # NB: the parse loop is fed by a heredoc, NOT wrapped in $( … ) — bash 3.2
   # (macOS, where this repo's `sh -n` lint runs) mis-parses a `case` inside a
   # command substitution. Keep case statements out of $( ).
+  # The nodes come back as bare IPs, and on a workstation a bare IP does NOT
+  # inherit the ~/.ssh/config Host block that makes the CONTROLLER reachable —
+  # so probing them would fail auth even though the mesh is fine (observed live
+  # 2026-07-28). The controller knows the answer: AiMesh syncs the admin
+  # username to every unit (verified 2026-07-22), so ask for it and use it.
+  DISCOVERED_USER=""
+  if [ -z "$FLEET_USER" ]; then
+    DISCOVERED_USER=$(_run_on "$FLEET_PROBE_TIMEOUT" 'nvram get http_username' 2>/dev/null |
+                      grep -v '^[[:space:]]*$' | tail -1 | tr -dc 'A-Za-z0-9._-')
+    if [ -n "$DISCOVERED_USER" ]; then
+      FLEET_USER=$DISCOVERED_USER
+      echo "Using the mesh admin username from the controller: $FLEET_USER"
+      echo
+    fi
+  fi
+
   cands=""
   _recs=$(echo "$raw" | tr '<' '\n')
   while IFS='>' read -r h ip mac role _rest; do
@@ -801,10 +871,13 @@ EOF
   done <<EOF
 $cands
 EOF
+  _userline=""
+  [ -n "$DISCOVERED_USER" ] && _userline="FLEET_USER=\"$DISCOVERED_USER\"
+"
   cat <<EOF
 
 Paste this into $CONF:
-
+$_userline
 FLEET_NODES="$(echo "$specline" | sed 's/ *$//')"
 
 Notes on that line:
@@ -910,6 +983,7 @@ cmd_push() {
   mode=644; [ -x "$src" ] && mode=755
   [ "$DRY_RUN" = "1" ] && echo "DRY RUN — nothing will be written."
   echo "fleetctl $VERSION — pushing $src -> $dest (mode $mode)"
+  _confirm_fanout "overwrite $dest (mode $mode) — any existing file there is replaced"
   for spec in $FLEET_NODES; do
     _parse_spec "$spec"
     echo
@@ -920,7 +994,14 @@ cmd_push() {
       continue
     fi
     if [ "$DRY_RUN" = "1" ]; then
-      echo "  would write $dest (mode $mode, $(wc -c < "$src" | tr -d ' ') bytes)"
+      # Dry run is read-only, so it can afford to LOOK: "would create" and
+      # "would overwrite" are very different sentences to a prod operator.
+      _ex=$(_run_on "$FLEET_PROBE_TIMEOUT" "[ -e '$dest' ] && echo overwrite || echo create" 2>/dev/null | tr -dc 'a-z')
+      _sz=$(wc -c < "$src" | tr -d ' ')
+      case "$_ex" in
+        overwrite) echo "  would OVERWRITE existing $dest (mode $mode, $_sz bytes)" ;;
+        *)         echo "  would create $dest (mode $mode, $_sz bytes)" ;;
+      esac
       _result "$SPEC_NAME" SKIPPED "dry run"
       continue
     fi
@@ -967,6 +1048,7 @@ cmd_install() {
   echo "fleetctl $VERSION — installing on every eligible node:"
   echo "  url:  $url"
   [ -n "$args" ] && echo "  args: $args"
+  _confirm_fanout "download and RUN this installer as root: $url${args:+ $args}"
   # Download to a file and run it, rather than curl|sh: it separates "download
   # failed" from "install failed", and it leaves the installer's stdin free
   # (an installer arriving ON stdin cannot read stdin — see the addon contract
@@ -1167,6 +1249,7 @@ while [ $# -gt 0 ]; do
     --include-self)   INCLUDE_SELF=1; shift ;;
     --allow-unpinned) ALLOW_UNPINNED=1; shift ;;
     --porcelain)      PORCELAIN=1; shift ;;
+    --yes|-y)         ASSUME_YES=1; shift ;;
     --nodes)          [ -n "$2" ] || die "--nodes needs a value"; FLEET_NODES=$2; shift 2 ;;
     -v|--version)     echo "fleetctl $VERSION"; exit 0 ;;
     -h|--help)        usage; exit 0 ;;
