@@ -186,6 +186,11 @@ public:
   per-node wall-clock cap is our own watchdog: background the child, background
   a sleeper that kills it, marker file to tell a timeout from an ordinary
   non-zero exit. Do not reintroduce a dependency on `timeout`.
+- **`fold` is absent** (checked 2026-07-28), and a `cmd | fold | sed || fallback`
+  chain does not fail over: the pipeline's status is the LAST stage's, which
+  exits 0, so the fallback never runs and the output silently disappears. When
+  an applet may be missing, do not paper over it with `||` after a pipeline —
+  either probe it with `which` first, or do without it.
 - **Verify EVERY applet with `which` before relying on it**, and the same for
   **dbclient's own flags** — an unknown flag makes dbclient exit *before*
   connecting, so `-K`/`-M` are used only when `dbclient -h` advertises them.

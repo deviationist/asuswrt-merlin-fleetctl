@@ -814,7 +814,16 @@ EOF
         printf '  %-19s %-13s %-10s auth: ok    merlin: no   (run only)%s\n' "$shown" "$label" "$P_MODEL" "$tag"
       fi
     else
-      printf '  %-19s %-13s %-10s auth: FAIL  %s\n' "$shown" "$label" "-" "$(echo "$P_REASON" | cut -c1-70)"
+      # The reason is the whole point of a failed row, so it gets its own line
+      # rather than being cut off at the table's right edge. Truncating it hid
+      # the actual dbclient error on hardware (2026-07-28) and left the user
+      # with "unreachable: dbclient:" — worse than useless.
+      printf '  %-19s %-13s %-10s auth: FAIL\n' "$shown" "$label" "-"
+      # No `fold` here: it is ABSENT on this firmware (checked 2026-07-28), and
+      # a `… | fold | sed || fallback` chain would not even fail over — the
+      # pipeline's status comes from the last stage, which exits 0, so the line
+      # would silently vanish. Let the terminal soft-wrap instead.
+      echo "      $P_REASON"
     fi
     specline="$specline$spec "
   done <<EOF
