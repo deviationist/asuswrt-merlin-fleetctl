@@ -165,24 +165,6 @@ nonzero(){ if [ "$2" != "0" ]; then PASS=$((PASS+1)); printf '  ok   %s\n' "$1";
 
 echo "fleetctl tests ($SH):"
 
-# === setup ==================================================================
-echo "-- keygen"
-reset; conf "FLEET_KEY=\"$KEY\""
-out=$(run keygen 2>&1)
-has  "keygen: prints the pubkey line"          "$out" "ssh-ed25519 AAAA"
-is   "keygen: key file created"                "$([ -f "$KEY" ] && echo y)" "y"
-has  "keygen: tells the user where to paste"   "$out" "SSH Authentication key"
-has  "keygen: says AiMesh syncs it"            "$out" "AiMesh syncs that field"
-echo "SENTINEL" > "$KEY"
-out=$(run keygen 2>&1)
-has  "keygen: refuses to clobber an existing key" "$out" "Key already exists"
-out=$(run setup 2>&1)
-has  "keygen: 'setup' still works as the old name" "$out" "Key already exists"
-is   "keygen: existing key untouched"          "$(cat "$KEY")" "SENTINEL"
-out=$(run keygen --force 2>&1)
-has  "keygen --force: warns the old key stays authorized" "$out" "OLD public key stays authorized"
-is   "keygen --force: key replaced"            "$(cat "$KEY")" "MOCK-PRIVATE-KEY"
-
 # === discover ===============================================================
 echo "-- discover"
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_CONTROLLER="self"'
@@ -278,7 +260,7 @@ has  "workstation: bare host lets ~/.ssh/config decide" "$(cat "$TMP/sshlog")" "
 
 reset; conf 'FLEET_NODES="192.168.1.2,mac=AA:BB:CC:DD:EE:02"' "FLEET_KEY=\"$TMP/absent.key\""
 out=$(run health 2>&1); rc=$?
-has  "workstation: a missing key is not a failure" "$out" "relying on your own ~/.ssh"
+has  "workstation: a missing key is not a failure" "$out" "credentials your SSH client already has"
 is   "workstation: health still passes"       "$rc" "0"
 
 # === node specs =============================================================
@@ -626,8 +608,9 @@ echo "-- health"
 # FLEETCTL_PLATFORM forces the branch so both platforms stay covered.
 reset; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES=""'
 out=$(runp router health 2>&1); rc=$?
-has  "health (router): missing key is a FAIL" "$out" "no key at"
-nonzero "health (router): FAIL => non-zero exit" "$rc"
+has  "health: a missing key is reported, not judged" "$out" "no key at"
+has  "health: defers the verdict to reachability" "$out" "the real test"
+is   "health: missing key alone is not a failure" "$rc" "0"
 
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES=""'
 out=$(runp router health 2>&1)

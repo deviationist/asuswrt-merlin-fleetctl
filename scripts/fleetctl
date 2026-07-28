@@ -13,10 +13,10 @@
 #   once, and AiMesh syncs that field byte-for-byte to every node, current and
 #   future. Zero per-node steps, and the password escape hatch is untouched.
 #
-#   The single exception is `keygen`, which is never run for you (not by the
-#   installer, not by another verb): it writes a keypair into fleetctl's OWN
-#   directory and prints the public half. It authorizes nothing. Point
-#   FLEET_KEY at a key you already have and you never need it at all.
+#   Getting access to your own routers is YOUR business, not this tool's.
+#   fleetctl has no verb that creates, installs or manages credentials — it
+#   only uses what the config names. Generate keys with dropbearkey or
+#   ssh-keygen, authorize them however you like; fleetctl starts after that.
 #
 # NON-GOALS (stated so they cannot drift):
 #   - fleetctl NEVER writes sshd_authkeys or any AiMesh-synced / security-
@@ -223,10 +223,10 @@ _password_for() {
   if [ -z "$_pw" ]; then
     # Never block waiting for input that can never arrive: a cron-driven or
     # piped invocation has no TTY, and a prompt there would hang forever.
-    _have_tty || die "password auth needs a terminal, and this invocation has no TTY (cron/pipe?). Use key auth: fleetctl keygen"
+    _have_tty || die "password auth needs a terminal, and this invocation has no TTY (cron/pipe?). Configure a key fleetctl can use (FLEET_KEY, or key= on the node spec)"
     echo "FLEET_ALLOW_PASSWORD — using password auth for $1. This is the discouraged path:" >&2
     echo "  the mesh admin password transits process environments on every hop." >&2
-    echo "  Set up the key instead; it is one paste: fleetctl keygen" >&2
+    echo "  Use key auth instead — see the README on authorizing a key mesh-wide" >&2
     printf 'password for %s@%s: ' "$SPEC_USER" "$1" >&2
     # stty acts on ITS stdin — redirect it, or a piped invocation silently echoes
     stty -echo < /dev/tty 2>/dev/null
@@ -419,7 +419,7 @@ _probe() {
   # whole fan-out (continue-on-error: a half-run mesh with no record of where
   # it stopped is worse than a full run with failures listed).
   if [ "$SPEC_PASS" = "1" ] && [ "$FLEET_ALLOW_PASSWORD" != "1" ]; then
-    P_REASON="spec requests password auth, but FLEET_ALLOW_PASSWORD=0 in $CONF (key auth is the supported path: fleetctl keygen)"
+    P_REASON="spec requests password auth, but FLEET_ALLOW_PASSWORD=0 in $CONF (key auth is the supported path)"
     return 1
   fi
   _err="$TMPBASE.err"; _out="$TMPBASE.probe"
@@ -643,77 +643,6 @@ _require_target() {
 }
 
 # --- verbs ------------------------------------------------------------------
-
-# `keygen` is the ONLY command that creates credential material, it is never
-# run for you (not by the installer, not by another verb), and it writes only
-# into fleetctl's own directory. It does not authorize the key anywhere: no
-# authorized_keys, no nvram, no GUI automation. Authorizing is the operator's
-# action, in the GUI, where the password escape hatch still exists.
-cmd_keygen() {
-  # Key generation differs by platform: dropbearkey on the router, ssh-keygen
-  # on a workstation. The PUBLIC key is the same shape either way, which is all
-  # the GUI field cares about.
-  if which dropbearkey >/dev/null 2>&1; then KEYGEN=dropbear
-  elif which ssh-keygen >/dev/null 2>&1; then KEYGEN=openssh
-  else die "neither dropbearkey nor ssh-keygen found — cannot generate a key here"
-  fi
-  mkdir -p "$(dirname "$FLEET_KEY")" 2>/dev/null
-  if [ "$PLATFORM" = "workstation" ] && [ ! -f "$FLEET_KEY" ] && [ "$1" != "--force" ]; then
-    echo "note: on a workstation you may not need a fleetctl key at all — if your"
-    echo "      ~/.ssh already reaches the router (an agent, or a Host block), leave"
-    echo "      FLEET_KEY unset and fleetctl will let OpenSSH authenticate as usual."
-    echo
-  fi
-  if [ -f "$FLEET_KEY" ] && [ "$1" != "--force" ]; then
-    echo "Key already exists: $FLEET_KEY  (use 'fleetctl keygen --force' to replace it)"
-  else
-    if [ -f "$FLEET_KEY" ]; then
-      echo "Replacing $FLEET_KEY — the OLD public key stays authorized until you"
-      echo "remove it from the router GUI's key field. Do that after this works."
-      rm -f "$FLEET_KEY" "$FLEET_KEY.pub"
-    fi
-    # fleetctl's OWN path — deliberately NOT /jffs/.ssh/, which holds the
-    # firmware's sshd HOST keys. File creation only; no nvram is written.
-    if [ "$KEYGEN" = "dropbear" ]; then
-      dropbearkey -t ed25519 -f "$FLEET_KEY" >/dev/null 2>&1 ||
-        dropbearkey -t rsa -s 3072 -f "$FLEET_KEY" >/dev/null 2>&1 ||
-        die "key generation failed (dropbearkey)"
-    else
-      ssh-keygen -q -t ed25519 -N '' -C "fleetctl@$(hostname 2>/dev/null || echo workstation)" -f "$FLEET_KEY" </dev/null >/dev/null 2>&1 ||
-        die "key generation failed (ssh-keygen)"
-    fi
-    chmod 600 "$FLEET_KEY"
-    echo "Generated $FLEET_KEY"
-  fi
-  if [ "$KEYGEN" = "dropbear" ]; then
-    pub=$(dropbearkey -y -f "$FLEET_KEY" 2>/dev/null | grep -E '^(ssh|ecdsa)-' | head -1)
-  else
-    pub=$(cat "$FLEET_KEY.pub" 2>/dev/null | grep -E '^(ssh|ecdsa)-' | head -1)
-    [ -n "$pub" ] || pub=$(ssh-keygen -y -f "$FLEET_KEY" 2>/dev/null | head -1)
-  fi
-  [ -n "$pub" ] || die "could not read the public key out of $FLEET_KEY"
-  echo "$pub" > "$FLEET_KEY.pub"; chmod 644 "$FLEET_KEY.pub"
-  cat <<EOF
-
---- copy the line below (all of it, one line) -------------------------------
-$pub
------------------------------------------------------------------------------
-
-Next: authorize it on the mesh — ONE paste, no per-node steps.
-
-  1. Router GUI -> Administration -> System -> "SSH Authentication key"
-  2. Paste the line above on its OWN line, keeping any keys already there.
-  3. Apply.
-
-AiMesh syncs that field byte-for-byte to every node, current AND future, so
-every node accepts this key without being touched individually. fleetctl does
-not write it for you on purpose: authorized-keys is the one setting that can
-lock you out of your own mesh, so it stays a human action in the GUI.
-(Side effect: the router authorizes its own key. Harmless.)
-
-Then:  fleetctl discover   ->  paste FLEET_NODES into $CONF  ->  fleetctl nodes
-EOF
-}
 
 cmd_discover() {
   # The mesh membership list lives in the CONTROLLER's nvram, so discovery
@@ -1110,9 +1039,6 @@ cmd_health() {
   else
     bad "no SSH client found (dbclient/ssh) — fan-out impossible"
   fi
-  if which dropbearkey >/dev/null 2>&1; then ok "key generation: dropbearkey"
-  elif which ssh-keygen >/dev/null 2>&1; then ok "key generation: ssh-keygen"
-  else note "neither dropbearkey nor ssh-keygen — 'fleetctl keygen' cannot generate a key here"; fi
   which curl >/dev/null 2>&1 && ok "curl available (needed by 'update')" || note "curl missing — 'update' will not work"
   [ -d "$FLEET_HOME/.ssh" ] && ok "known_hosts dir: $FLEET_HOME/.ssh" || note "no $FLEET_HOME/.ssh yet (created on first connection)"
 
@@ -1128,15 +1054,14 @@ cmd_health() {
       -rw-------) ok "key permissions are 0600" ;;
       *) note "key is group/other-readable — chmod 600 $FLEET_KEY" ;;
     esac
-    [ -f "$FLEET_KEY.pub" ] && ok "public key present: $FLEET_KEY.pub" || note "no $FLEET_KEY.pub — run 'fleetctl keygen' to re-derive it"
   elif [ "$FLEET_ALLOW_PASSWORD" = "1" ]; then
     note "no key ($FLEET_KEY) — falling back to the discouraged password path"
-  elif [ "$PLATFORM" = "workstation" ]; then
-    # Not a failure off-router: OpenSSH may well authenticate from an agent or
-    # a ~/.ssh/config Host block, which is the nicest workstation setup there is.
-    note "no fleetctl key ($FLEET_KEY) — relying on your own ~/.ssh (agent or Host config)"
   else
-    bad "no key at $FLEET_KEY and FLEET_ALLOW_PASSWORD=0 — run 'fleetctl keygen'"
+    # NOT a FAIL. Credentials are the operator's to arrange — an agent, a
+    # ~/.ssh/config Host block, a key elsewhere, a password. Whether they
+    # actually work is answered authoritatively by the per-node auth checks
+    # below, which is the only test that means anything.
+    note "no key at $FLEET_KEY — fleetctl will use whatever credentials your SSH client already has; the per-node checks below are the real test"
   fi
   [ "$FLEET_ALLOW_PASSWORD" = "1" ] && note "FLEET_ALLOW_PASSWORD=1 — password auth permitted; it is never stored, but it does transit process environments"
   [ "$FLEET_STRICT_HOSTKEY" = "1" ] && ok "strict host-key checking on" || note "unknown host keys are accepted on first contact (TOFU); a CHANGED key is always refused"
@@ -1209,8 +1134,6 @@ fleetctl $VERSION — AiMesh fleet orchestration for Asuswrt-Merlin
 usage: fleetctl [flags] <verb> [args]
 
 verbs:
-  keygen [--force]         create a client keypair, print the pubkey to paste
-                           (optional: point FLEET_KEY at an existing key instead)
   discover                 list AiMesh nodes this controller knows about
   nodes                    status of every node configured in fleetctl.conf
   run <command...>         run a command on every node (read-only gate)
@@ -1278,8 +1201,6 @@ fi
 
 VERB=$1
 case "$VERB" in
-  keygen)    shift; cmd_keygen "$@" ;;
-  setup)     shift; cmd_keygen "$@" ;;   # pre-0.2 name, still accepted
   discover)  cmd_discover ;;
   nodes)     cmd_nodes ;;
   run)       shift; cmd_run "$@" ;;

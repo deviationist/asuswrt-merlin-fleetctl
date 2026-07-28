@@ -89,15 +89,23 @@ if [ ! -f "$CONF" ]; then
 # a mismatch. Paths in key= must not contain spaces.
 FLEET_NODES=""
 
+# Which unit 'discover' asks for the mesh list. On a router this defaults to
+# itself; on a workstation fleetctl falls back to the LAN default gateway and
+# confirms what it finds. Set it explicitly if you reach the router through an
+# SSH alias (a Host block supplies the user and key that a bare IP does not).
+#FLEET_CONTROLLER=""
+
 # Defaults inherited by every node that does not override them.
 #FLEET_USER=""                          # empty => nvram http_username (AiMesh syncs it mesh-wide)
 #FLEET_PORT=""                          # empty => nvram sshd_port, else 22
-#FLEET_KEY="/jffs/scripts/fleetctl.key" # created by 'fleetctl setup'
+#FLEET_KEY="/jffs/scripts/fleetctl.key" # a key YOU created and authorized;
+                                        # leave unset on a workstation to let
+                                        # ~/.ssh (agent or Host block) decide
 
-# Password auth: supported reluctantly, discouraged loudly. Key auth is one
-# paste ('fleetctl setup'). With this on, the password is prompted for once per
-# invocation and kept in memory only — it is NEVER written to this file or any
-# other, because that would leave a plaintext mesh-admin credential on flash.
+# Password auth: supported reluctantly, discouraged loudly. With this on, the
+# password is prompted for once per invocation and kept in memory only — it is
+# NEVER written to this file or any other, because that would leave a plaintext
+# mesh-admin credential on flash.
 #FLEET_ALLOW_PASSWORD=0
 
 # Host keys are trust-on-first-use by default: an UNKNOWN key is accepted and
@@ -130,21 +138,21 @@ fi
 echo "fleetctl installed at $TOOL ($PLATFORM)"
 echo
 
-# Deliberately does NOT generate a key. Credential material is the operator's
-# to create and authorize; fleetctl only ever REFERENCES what the config names
-# (see README, "What fleetctl does not touch"). Installing a tool should not
-# silently mint a private key on someone's system — so `keygen` stays an
-# explicit, optional command.
+# Deliberately creates no credentials. Getting access to your own routers is
+# the operator's business; fleetctl's business is distributing an addon using
+# the credentials the config names. There is no key-generation command at all —
+# see README, "What fleetctl does not touch".
 if [ "$PLATFORM" = "router" ]; then
   cat <<EOF
 Next:
 
-  1. Get an SSH key onto the mesh. If you do not already have one:
-         fleetctl keygen              # writes only into $CONFDIR, authorizes nothing
-     Then paste the printed public key into the router GUI
-     (Administration -> System -> "SSH Authentication key") and Apply.
-     AiMesh syncs that field to every node, so this is the only per-mesh step.
-     Already have a key you use for the router? Just point FLEET_KEY at it.
+  1. Make sure fleetctl can log in to your units. That part is yours, not
+     fleetctl's: point FLEET_KEY at a key you already use, or make one with
+         dropbearkey -t ed25519 -f $CONFDIR/fleetctl.key
+         dropbearkey -y -f $CONFDIR/fleetctl.key      # public half, to authorize
+     Pasting it into the router GUI (Administration -> System -> "SSH
+     Authentication key") authorizes it on every node at once — AiMesh syncs
+     that field mesh-wide, so it is the only per-mesh step.
 
   2. fleetctl discover                 # nodes + a conf-ready FLEET_NODES line
   3. fleetctl nodes                    # verify auth + eligibility per node
@@ -161,8 +169,9 @@ Next:
          FLEET_CONTROLLER="192.168.1.1"   # or a Host alias from ~/.ssh/config
      If your ~/.ssh already reaches the router (agent, or a Host block), there
      is nothing else to set up — leave FLEET_KEY unset and OpenSSH decides.
-     Otherwise: fleetctl keygen, then paste the public key into the router GUI
-     (Administration -> System -> "SSH Authentication key").
+     Otherwise make one with ssh-keygen and authorize it on the router the way
+     you normally would (the GUI's "SSH Authentication key" field syncs it to
+     every node at once).
 
   2. fleetctl discover                 # nodes + a conf-ready FLEET_NODES line
   3. fleetctl nodes                    # verify auth + eligibility per node

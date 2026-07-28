@@ -80,11 +80,21 @@ If you already have a `Host router` block, `FLEET_NODES="router"` just works.
 **You prepare the trust; fleetctl only consumes it.** fleetctl never writes
 `sshd_authkeys` or any other security-relevant nvram.
 
-If you do not already have a key that reaches the router, `fleetctl keygen`
-writes one into fleetctl's own directory and prints the public half. (It is
-never run for you — see [What fleetctl does not touch](#what-fleetctl-does-not-touch).
-Already have a key? Point `FLEET_KEY` at it, or on a workstation just let
-`~/.ssh` do its job.) Then:
+**Getting access to your own routers is your business, not fleetctl's.** It has
+no command that creates, installs or manages credentials — it uses what your
+config names, and nothing else. Make a key the ordinary way:
+
+```sh
+dropbearkey -t ed25519 -f /jffs/scripts/fleetctl.key   # on the router
+dropbearkey -y -f /jffs/scripts/fleetctl.key           # print the public half
+
+ssh-keygen -t ed25519 -f ~/.config/fleetctl/fleetctl.key   # on a workstation
+```
+
+Or skip that entirely and point `FLEET_KEY` at a key you already have — on a
+workstation, leave it unset and let your agent or `~/.ssh/config` do the job.
+
+Then, to authorize it across the mesh in one step:
 
 1. Router GUI → **Administration → System → "SSH Authentication key"**
 2. Paste the line on its **own line**, keeping any keys already there. Apply.
@@ -148,7 +158,6 @@ The single remote device case needs no special support either: one spec in
 
 | Verb | What it does | Needs |
 |---|---|---|
-| `keygen [--force]` | create a keypair, print the pubkey to paste (optional) | — |
 | `discover` | parse `cfg_device_list` → pinned, conf-ready node specs | — |
 | `nodes` | per-node auth / model / pin / eligibility | SSH |
 | `run <cmd…>` | run a command on every node, output prefixed `[node]` | SSH |
@@ -304,7 +313,6 @@ grep -nE 'cru |services-start|firewall-start|nvram set|service restart' scripts/
 |---|---|---|
 | `<confdir>/fleetctl` | install | the tool itself |
 | `<confdir>/fleetctl.conf` | install, once | never overwritten afterwards |
-| `<confdir>/fleetctl.key{,.pub}` | only if you run `keygen` | never automatic |
 | `<confdir>/fleetctl.d/.ssh/known_hosts` | first connection, router only | a few hundred bytes |
 | `/jffs/configs/profile.add` | install, one appended line | skip with `install.sh --no-path` |
 | `/tmp/fleetctl.*` | per run | RAM; buffered output, lock, markers |
@@ -363,11 +371,9 @@ tool. Concretely, fleetctl never:
 The config names *which* key, user, port or auth method to connect with. That is
 the whole of fleetctl's involvement with credentials.
 
-The one command that creates key material is **`keygen`**, and it is a
-convenience you can ignore: it writes a keypair into fleetctl's own directory,
-prints the public half, and authorizes nothing. It is never run for you — not by
-the installer, not by another verb. Point `FLEET_KEY` at a key you already have,
-or on a workstation let `~/.ssh` handle it, and `keygen` never needs to exist.
+There is **no command that creates key material** — fleetctl has no `keygen`,
+no key installer, no password manager. Use `dropbearkey` or `ssh-keygen`, which
+already ship on the machines involved.
 
 Authorizing the key stays a human action in the router GUI, on purpose:
 authorized-keys is the one setting that can lock you out of your own mesh, and
@@ -554,7 +560,7 @@ extenders.
 
 | Symptom | Meaning |
 |---|---|
-| `SSH auth failed` | the key is not authorized yet — paste it into the GUI field and Apply |
+| `SSH auth failed` | the credentials in your config do not open that unit. Authorizing them is outside fleetctl's remit — fix it the way you normally would, then re-run |
 | `HOST KEY MISMATCH` | that address answered with a different host key: a reflash, or another host holds it now. Verify, then remove the entry from `/jffs/scripts/fleetctl.d/.ssh/known_hosts` |
 | `no MAC pin` | mutating verbs need `mac=` — re-run `fleetctl discover` for pinned specs |
 | `does not match this host` | DHCP moved the address. Re-run `fleetctl discover` |

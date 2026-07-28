@@ -37,13 +37,23 @@ story auditable. So fleetctl must never:
 - store a password (the opt-in prompt is process-memory only, never disk);
 - read credentials from anywhere but the config the operator wrote.
 
-`keygen` is the sole command that creates key material. It writes only into
-fleetctl's own directory, prints the public half, authorizes nothing, and is
-**never invoked for the user** — not by the installer, not by another verb.
-(The installer used to run it automatically; that was removed, because
-installing a tool should not silently mint a private key on someone's system.)
-If you are tempted to add "helpfully install the key for them", don't: that is
-the one action that can lock a user out of their own mesh.
+**There is no key-generation command, and there must not be one.** fleetctl had
+a `keygen` verb; it was removed at the owner's direction (2026-07-28). The scope
+line is: *getting access to your own routers is the user's business; fleetctl's
+business is distributing an addon to multiple devices using the credentials the
+user supplies.* `dropbearkey` and `ssh-keygen` already exist on the machines
+involved, and the README shows the one-liners.
+
+Do not reintroduce it, and do not add its neighbours either — no "helpfully
+authorize the key for them" (that is the one action that can lock a user out of
+their own mesh), no password storage, no credential discovery. Every one of
+those sounds helpful and every one widens this tool from a distributor into a
+credential manager.
+
+Corollary for `health`: a missing key is a **note, not a FAIL**. Whether the
+operator's credentials work is answered by the per-node auth checks, which is
+the only test that means anything — fleetctl reports reachability, it does not
+grade credential hygiene.
 
 ## Two platforms, one tool
 
