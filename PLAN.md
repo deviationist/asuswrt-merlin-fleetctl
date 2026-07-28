@@ -9,6 +9,10 @@ general capability, own repo, addon-independent.
 Born from a field request by SNBForums user jksmurf (flowcache-doctor thread
 97561, post-998532): one-off install across the mesh, no per-node SSH toil.
 
+Requirements from the first consumer are in `CONSUMER-BRIEF.md`. Contributor
+constraints and design invariants are in `AGENTS.md`. This file tracks **what
+is built, what is verified, and what is still open**.
+
 ## Why standalone
 
 - Nothing in it is addon-specific: discovery, trust model, eligibility gate,
@@ -38,7 +42,7 @@ One-time user setup:
    `/root/.ssh/authorized_keys`, `cfg_client` daemon carries it). Current
    AND future nodes inherit the trust automatically — zero per-node steps.
 3. The user lists the nodes in `fleetctl.conf` (`fleetctl discover` suggests
-   them, see below).
+   them, pinned and conf-ready).
 
 Side effect worth documenting: the router's key ends up authorized on the
 router itself. Harmless; lets fleet code treat "local unit" and "remote
@@ -47,17 +51,13 @@ node" uniformly if ever useful.
 ### Password login (supported reluctantly, discouraged loudly)
 
 Key auth is the design. Password auth exists only as an explicit opt-in
-escape hatch (`FLEET_ALLOW_PASSWORD=1`) for "I just want to try it" cases:
-
-- Mechanism: dropbear's `dbclient` reads the `DROPBEAR_PASSWORD` env var
-  (compile-time option — **VERIFY it's enabled in Merlin's dbclient before
-  documenting**). fleetctl prompts ONCE per invocation, exports for its
-  child dbclient calls, never echoes, **never stores** — no password ever
-  lands in conf, script, or JFFS.
-- Why it's bad and stays discouraged: the mesh admin password transits
-  process environments; any conf-file storage would be a plaintext admin
-  credential on flash. README frames it as "works, but set up the key —
-  it's one paste."
+escape hatch (`FLEET_ALLOW_PASSWORD=1`, or `auth=pass` per node) for "I just
+want to try it" cases. **Verified 2026-07-28: `DROPBEAR_PASSWORD` IS compiled
+into Merlin's dbclient** (v2026.91 on 3006.102.8), so the fallback works — it
+stays discouraged on trust grounds, not capability grounds. Prompted once per
+scope, never echoed, **never stored**; no password lands in conf, script, or
+JFFS. Refuses to prompt when there is no TTY (a cron fan-out must fail, not
+hang).
 
 ## Architecture
 
@@ -65,55 +65,80 @@ Single busybox-sh script + conf, mirroring the doctor's conventions:
 
 - `/jffs/scripts/fleetctl` — the tool
 - `/jffs/scripts/fleetctl.conf` — user config (created by installer with
-  commented defaults)
-- Key at `/jffs/scripts/fleetctl.key` (+ `.pub`) by default
-- Installed via curl one-liner from `main` (same distribution model as the
-  doctor); self-update via the doctor's proven `update` pattern (download
-  to /tmp, exec — never overwrite a running script; `?cb=$(date +%s)`
-  cache-bust; raw CDN lags pushes ~5 min)
+  commented defaults; never overwritten)
+- `/jffs/scripts/fleetctl.key` (+ `.pub`) — the client keypair
+- `/jffs/scripts/fleetctl.d/.ssh/known_hosts` — fleetctl's own TOFU store
+- Installed via curl one-liner from `main`; self-update via the doctor's
+  proven `update` pattern (download to /tmp, exec — never overwrite a
+  running script; `?cb=$(date +%s)` cache-bust; raw CDN lags pushes ~5 min)
 
-### Config surface
+### Node specs (revised 2026-07-28)
 
-```sh
-FLEET_NODES=""            # explicit, space-separated IPs/hosts — source of truth
-FLEET_USER=""             # default: $(nvram get http_username) — AiMesh syncs
-                          # the admin user to nodes (verified), so empty usually works
-FLEET_KEY="/jffs/scripts/fleetctl.key"
-FLEET_ALLOW_PASSWORD=0    # 1 = permit DROPBEAR_PASSWORD prompt fallback (discouraged)
+The original single-field `FLEET_NODES` list did not survive contact with the
+real question: *how is each node actually reachable?* A node may be an IP or a
+hostname, on port 22 or a custom port, authenticated by key or password, with
+one shared credential or one per node. `FLEET_NODES` therefore holds **specs**:
+
+```
+[user@]host[:port][,key=value]...
+fields: port=  user=  key=<identity file>  auth=pass|key  mac=<pin>  name=<label>
 ```
 
-Explicit `FLEET_NODES` (not live discovery) is deliberate: discovery output
-can drift (node offline, re-IP), and a fan-out tool must have a stable,
-user-owned target list. Discovery is a suggestion generator, never the
-runtime source.
+One list, not a list plus a side table — a fan-out tool with two sources of
+truth for "who is in the fleet" is a foot-gun. Everything omitted inherits the
+conf defaults (`FLEET_USER`, `FLEET_PORT`, `FLEET_KEY`).
 
-### Verbs (v0.1)
+Explicit `FLEET_NODES` (not live discovery) remains the runtime source of
+truth: discovery output drifts (node offline, re-IP), and a tool that opens
+root shells must aim at a stable, user-owned target list. Discovery is a
+suggestion generator that emits **pinned** specs, so the safe path is the
+default one.
+
+### Verbs (v0.1 — all built)
 
 | Verb | Action | Writes? |
 |---|---|---|
-| `discover` | parse `cfg_device_list` nvram → candidate nodes; test SSH auth + Merlin eligibility per node; print conf-ready `FLEET_NODES` line | no |
+| `discover` | parse `cfg_device_list` nvram → candidate nodes; test SSH auth + Merlin eligibility per node; print conf-ready pinned specs | no |
 | `setup` | generate keypair (if absent), print pubkey + GUI paste instructions | key files only |
-| `nodes` | list configured nodes with reachability/auth/eligibility status | no |
-| `run <cmd>` | execute on every node, output prefixed `[node-ip]` | whatever cmd does |
-| `push <file> <dest>` | scp fan-out | remote file |
-| `install <url>` | curl-pipe-sh a standard addon installer on every **eligible** node | remote install |
-| `health` | self-check (key present, conf sane, per-node auth) — doctor's health pattern | no |
+| `nodes` | list configured nodes with reachability/auth/pin/eligibility status | no |
+| `run <cmd>` | execute on every node, output prefixed `[node]` | whatever cmd does |
+| `push <file> <dest>` | `cat`-stream fan-out, atomic temp+mv | remote file |
+| `install <url> [args]` | download + run a standard addon installer on every **eligible** node; args pass through, so `install <url> uninstall` is fleet rollback | remote install |
+| `health` | self-check (key, conf, client, per-node auth/pin/eligibility) | no |
 | `update` | self-update | /tmp + exec |
+| `uninstall` | remove fleetctl from this router | removes own files |
+
+Global flags (before the verb): `--dry-run`, `--nodes`, `--include-self`,
+`--allow-unpinned`.
+
+### Fan-out safety (from `CONSUMER-BRIEF.md` §3 — all implemented)
+
+Per-node OK/FAIL/SKIPPED summary + non-zero exit on any failure; wall-clock
+timeouts on every remote call (own watchdog — **there is no `timeout` applet**);
+continue-on-error; MAC-pin + ASUS-identity verification before anything
+mutating; controller excluded from fan-out by default; no prompting without a
+TTY; `--dry-run`; single-instance `mkdir` lock; serial with per-node buffering;
+installer stdout surfaced per node (the placebo problem — an addon can exit 0
+and still be inert).
 
 ### Eligibility gate
 
-`install` (and anything touching `/jffs`) requires per node, checked live,
-skip-with-stated-reason on failure:
+`install`/`push` require per node, checked live, skip-with-stated-reason on
+failure:
 
 - Merlin firmware with custom scripts: `nvram get jffs2_scripts` = 1
   (verified signature: stock RP-BE58 returns empty → correctly ineligible)
 - `/jffs/scripts` exists
 - SSH auth works
 
-`run`/`push` only require SSH — a stock node is a valid `run` target
-(useful in itself: stock nodes still answer `nvram get`, `wl`, etc.).
+`run` only requires SSH — a stock node is a valid `run` target (useful in
+itself: stock nodes still answer `nvram get`, `wl`, etc.).
 
-## Verified facts (dev mesh: RT-BE92U 3006.102.8 controller + stock RP-BE58 node, 2026-07-22)
+## Verified facts
+
+Dev mesh: RT-BE92U 3006.102.8 controller + stock RP-BE58 node.
+
+**2026-07-22**
 
 - Discovery: `nvram get cfg_device_list` → `<host>ip>mac>role` entries,
   `<`-separated; role `0` = node, `1` = controller (lists itself).
@@ -127,44 +152,114 @@ skip-with-stated-reason on failure:
   SSH LAN-only (`sshd_enable=2`).
 - Admin username syncs mesh-wide → `FLEET_USER` default works.
 
-## Open questions / verify before shipping
+**2026-07-28** (read-only probe, resolving transport unknowns)
 
-- `DROPBEAR_PASSWORD` env support in Merlin's dbclient build (gates the
-  password fallback — if absent, drop the feature, keep key-only).
-- dbclient known-hosts policy: `-y` (accept new) on first contact vs
-  pinning; decide and document the MITM trade-off.
-- cfg-sync latency: does a key pasted into the GUI reach node
-  `authorized_keys` live, or on reboot/re-sync? (Untested — needs a write;
-  will be answered naturally during v0.1 testing on the dev mesh.)
-- `cfg_device_list` format on 3004-firmware controllers (jksmurf's
-  controller is 3006, so his mesh matches; pure-3004 meshes unverified).
-- scp vs `cat | ssh 'cat >'` for push (dropbear scp quirks).
-- Command name: `fleetctl` collides with the (dead) CoreOS fleetctl in
-  web-search space; on-router collision unlikely. Revisit before publish.
+- **No `timeout` applet.** Consequence: the per-node cap is fleetctl's own
+  watchdog (background child + background sleeper + marker file). This was the
+  single most load-bearing finding — the whole timeout design depended on it.
+- `flock` **is** present at `/usr/bin/flock`, but the lock uses `mkdir`
+  anyway: portable, applet-free, and correct on builds that lack flock.
+- dbclient is **Dropbear v2026.91**, and `ssh` is the same binary
+  (`ssh -V` → `Dropbear`), so OpenSSH flag assumptions would have been wrong.
+- dbclient supports `-p <port>`, `-i`, `-y`, **`-K <keepalive>`** and
+  **`-M <max_duration>`** — used as a backstop above our own watchdog, and only
+  when `dbclient -h` advertises them (an unknown flag makes dbclient exit
+  before connecting).
+- Its host syntax is `[user@]host/port`, **not** `host:port` — `-p` is used to
+  avoid the ambiguity entirely.
+- **`DROPBEAR_PASSWORD` is compiled in** (string present in the binary), so the
+  password escape hatch is viable.
+- Identity nvram available for pinning: `productid`, `lan_hwaddr`, `label_mac`.
 
-## Testability on the dev mesh
+**2026-07-28** (end-to-end validation of discovery + the gates, against the
+live controller and node — read-only)
 
-Everything except the `install` happy path is testable at home against the
-stock RP-BE58: `discover`, `setup`, key-auth hop, `run`, `push`, `nodes`,
-and the eligibility gate's skip path (the RP-BE58 IS the ineligible-node
-test case). The `install` happy path needs a Merlin node — field validation
-(jksmurf's AX3000 is the standing candidate).
+- The shipped discovery parser was run against the real `cfg_device_list` and
+  extracted the node while correctly dropping the controller. **The controller
+  is not necessarily the first record** — order carries no meaning, only
+  `role`.
+- **Key auth to the node works**: the GUI-pasted key authenticated straight
+  into the stock RP-BE58 with zero node-side setup, confirming the one-paste
+  trust model end to end (2026-07-22 verified the nvram sync; this verifies an
+  actual login).
+- The probe returns `model=RP-BE58 jffs= dir=no` from the stock node — i.e.
+  **the eligibility gate's skip path is proven on real hardware**, not just in
+  mocks.
+- **The MAC pin mechanism is proven**: the MAC that `cfg_device_list` reports
+  for the node IS present in that node's own MAC set (`lan_hwaddr` /
+  `label_mac` / `et0macaddr`). This is why `_pin_matches` tests membership in a
+  SET rather than comparing one nvram var — it does not need to know which MAC
+  AiMesh chose as the node's identity. Had this not matched, `install`/`push`
+  would have refused every node in the field.
 
-## Constraints (inherited from flowcache-doctor AGENTS.md — same platform)
+## Decisions taken (previously open)
 
-busybox sh only; no `pgrep`/`pkill`; no `command` builtin (use `which`);
-verify EVERY busybox applet with `which` before relying on it (mkfifo was
-missing there — assume nothing); no `tail | while read` pipeline subshells
-in daemons; never overwrite a running script (download to /tmp + exec);
-JFFS is flash — runtime state goes to /tmp; `cru` for cron. Dev-router
-mutations are run by the operator via `!`-prefixed commands, never by the
-assistant.
+- **known-hosts policy** → TOFU in fleetctl's own store. `-y` accepts an
+  *unknown* key and records it; a *changed* key stays fatal (never `-y -y`).
+  `$HOME` is repointed at `/jffs/scripts/fleetctl.d` so the store is
+  fleetctl's, not root's, and survives reboots (a few hundred bytes, written
+  once per node — within the flash-wear rule). `FLEET_STRICT_HOSTKEY=1` opts
+  into refusing unknown keys too.
+- **`scp` vs `cat | ssh`** → `cat`, with an atomic temp+`mv`. It needs only
+  `cat` on the far side (no scp/sftp binary, no dropbear scp quirks), and an
+  interrupted push cannot leave a half-written file in place of a working one.
+- **Command name** → keep `fleetctl`; the repo is published as
+  `asuswrt-merlin-fleetctl`, and the on-router collision risk is nil.
+- **PATH discoverability** → the installer appends one guarded line to
+  `/jffs/configs/profile.add` (removed on uninstall). Same fix should land in
+  flowcache-doctor (its issue #3) so the ergonomics match.
+
+## Open questions
+
+Ordered by how much they affect real users.
+
+1. **How does a user enable JFFS custom scripts on an AiMesh *node*?** The
+   gating precondition for installing any addon on a node, and a node has no
+   web UI of its own. Does `jffs2_scripts` sync from the controller the way
+   `sshd_authkeys` does, or must it be set per node over SSH? Field testers
+   have addons running on their nodes, so a path exists. **Until this is
+   answered, `install` is less useful than it looks** — the README says so
+   plainly rather than guessing.
+2. **Does a node's `/jffs` survive AiMesh re-onboarding / re-sync?** If
+   re-adding a node silently wipes the addon, "installed" is not a durable
+   state and `nodes` should be able to detect the drift.
+3. **cfg-sync latency for a GUI-pasted key** — live, or on reboot/re-sync?
+   The one-paste ergonomics depend on it. Testable at home; needs a write, so
+   it is an operator step.
+4. **`cfg_device_list` format on 3004-firmware controllers.** Parsed
+   defensively already (unrecognised → print raw + fall back to manual
+   `FLEET_NODES`), but unverified.
+5. **The `install` happy path on a Merlin node.** Everything else is provable
+   at home; this needs a Merlin node (jksmurf's AX3000 is the standing
+   candidate).
+6. **amtm packaging** — worth deciding before wide announcement.
+
+## Testability
+
+Everything except the `install` happy path is provable at home against the
+stock RP-BE58 — which IS the ineligible-node test case. Offline, 101 black-box
+tests (`sh scripts/fleetctl.test.sh`, also under `dash`) mock the router side
+and cover spec parsing, the pin/identity/eligibility gates, self-exclusion,
+continue-on-error, exit-status preservation, the timeout watchdog, dry-run, the
+lock, and discovery's defensive paths. They have already caught two real bugs
+(a `push` that silently wrote empty files, because a backgrounded command's
+stdin is `/dev/null`; and a lock that never held).
+
+## Constraints
+
+See `AGENTS.md` — busybox sh only, no `command` builtin, no `timeout`, verify
+every applet AND every dbclient flag, never `ps | grep` for processes, never
+overwrite a running script, JFFS is flash, `cru` for cron, dev-router mutations
+are operator-run.
 
 ## Milestones
 
-- **v0.1**: `discover` / `setup` / `nodes` / `run` / `health` — fully
-  provable on the dev mesh
-- **v0.2**: `push` / `install` + eligibility gate — gate provable at home,
-  install happy path validated in the field
-- **v0.3**: `update` self-update + docs + SNBForums announcement; doctor
-  README integration ("mesh rollout" section)
+- **v0.1** (built, offline-tested): `setup` / `discover` / `nodes` / `run` /
+  `push` / `install` / `health` / `update` / `uninstall`, with the full
+  fan-out safety model. Pending: live validation on the dev mesh, then the
+  `install` happy path in the field.
+- **v0.2**: whatever the dev-mesh and field runs teach us — plus open
+  questions 1–2, which may add a `nodes` drift check.
+- **v0.3**: docs + SNBForums announcement; doctor README integration
+  ("mesh rollout" section). Gated on flowcache-doctor issue #5 (fan-out
+  multiplies confident false positives — see `CONSUMER-BRIEF.md` §5).

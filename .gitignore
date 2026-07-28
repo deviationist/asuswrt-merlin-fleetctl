@@ -1,0 +1,13 @@
+# The live config lives on the router; it holds the user's node list (real
+# addresses, real MACs from discovery). Never commit one.
+fleetctl.conf
+
+# keys — never, under any circumstance
+*.key
+*.key.pub
+known_hosts
+
+# scratch / runtime
+*.t
+*.bak
+*.new

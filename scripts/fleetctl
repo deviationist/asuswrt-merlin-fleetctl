@@ -1,0 +1,862 @@
+#!/bin/sh
+# fleetctl — agnostic AiMesh fleet orchestration for Asuswrt-Merlin.
+#
+# Runs ON the main router (the AiMesh controller) and fans work out to the mesh
+# nodes over SSH: discover them, check them, run commands, push files, install
+# addons. It knows nothing about any specific addon.
+#
+# TRUST MODEL (the load-bearing design decision):
+#   The USER prepares the trust; fleetctl only consumes it. `setup` creates a
+#   keypair (file creation only, in fleetctl's OWN path — never /jffs/.ssh/,
+#   which holds the firmware's sshd HOST keys) and PRINTS the public key. The
+#   user pastes it into the router GUI's SSH authorized-keys field, and AiMesh
+#   syncs that field byte-for-byte to every node — current and future. Zero
+#   per-node steps, and the password escape hatch is never touched.
+#
+# NON-GOALS (stated so they cannot drift):
+#   - fleetctl NEVER writes sshd_authkeys or any AiMesh-synced / security-
+#     relevant nvram, on this router or on a node.
+#   - fleetctl NEVER restarts cfg_client / cfg_server. Corrupted cfg-sync is
+#     unrecoverable for a non-expert user; breaking the mesh is not an
+#     acceptable failure mode for an orchestration tool.
+#   - fleetctl is not addon-aware. Rollout, upgrade, fleet state and rollback
+#     are all the generic verbs (`install`, re-run `install`, `run`,
+#     `install <url> uninstall`).
+#
+# Usage: fleetctl [global flags] <verb> [args]   — see the bottom of this file.
+VERSION=0.1.0
+TAG=fleetctl
+REPO_RAW="https://raw.githubusercontent.com/deviationist/asuswrt-merlin-fleetctl/main"
+UPDATE_TMP=/tmp/fleetctl.update.sh          # transient installer copy for 'update' (RAM)
+
+# FLEETCTL_CONF / FLEETCTL_HOME overrides = testability (the test suite drives
+# the REAL script; nothing below is a test-only code path).
+CONF="${FLEETCTL_CONF:-/jffs/scripts/fleetctl.conf}"
+FLEET_HOME="${FLEETCTL_HOME:-/jffs/scripts/fleetctl.d}"   # our own known_hosts lives here
+
+# --- defaults (defined BEFORE sourcing the conf so the conf can override) ---
+FLEET_NODES=""                        # explicit node specs — the runtime source of truth
+FLEET_USER=""                         # empty => nvram http_username (AiMesh syncs it)
+FLEET_PORT=""                         # empty => nvram sshd_port, else 22
+FLEET_KEY="/jffs/scripts/fleetctl.key" # must not contain spaces (see _ssh_opts)
+FLEET_ALLOW_PASSWORD=0                # 1 = permit the discouraged password fallback
+FLEET_STRICT_HOSTKEY=0                # 1 = never auto-accept an unknown host key
+FLEET_PROBE_TIMEOUT=20                # seconds, per-node identity/eligibility probe
+FLEET_RUN_TIMEOUT=120                 # seconds, per-node `run`
+FLEET_INSTALL_TIMEOUT=600             # seconds, per-node `install` (downloads + install)
+[ -f "$CONF" ] && . "$CONF"
+
+# A comma-separated FLEET_NODES is a likely user slip, but commas are also our
+# per-node field separator — so only split on whitespace, and let the spec
+# parser deal with the rest.
+[ -n "$FLEET_USER" ] || FLEET_USER=$(nvram get http_username 2>/dev/null)
+[ -n "$FLEET_USER" ] || FLEET_USER=admin
+[ -n "$FLEET_PORT" ] || FLEET_PORT=$(nvram get sshd_port 2>/dev/null)
+[ -n "$FLEET_PORT" ] || FLEET_PORT=22
+
+# --- global flags (parsed by the dispatcher at the bottom) ---
+DRY_RUN=0
+INCLUDE_SELF=0
+ALLOW_UNPINNED=0
+
+# Per-node identity + eligibility, in ONE round trip. The __fleetprobe__ token
+# marks OUR line so a login banner can't be mistaken for the answer. An empty
+# model means "nvram did not answer" — i.e. not an ASUS unit at all, which is
+# a hard stop for anything mutating (see _require_target).
+PROBE='m=""; for v in lan_hwaddr label_mac et0macaddr et1macaddr; do x=$(nvram get $v 2>/dev/null); [ -n "$x" ] && m="$m$x,"; done; [ -d /jffs/scripts ] && d=yes || d=no; echo "__fleetprobe__ v=1 model=$(nvram get productid 2>/dev/null | tr " " "_") jffs=$(nvram get jffs2_scripts 2>/dev/null) dir=$d macs=$m"'
+
+die()  { echo "ERROR: $1" >&2; exit 1; }
+warn() { echo "warn: $1" >&2; }
+
+# --- single-instance lock ---------------------------------------------------
+# Two overlapping fan-outs (impatient user, or manual racing cron) writing the
+# same node's /jffs/scripts is a corruption path. `flock` exists on SOME builds
+# (present on RT-BE92U 3006) but not universally — mkdir is the portable
+# atomic-create primitive, so that is what we use. Stale locks are reclaimed by
+# checking /proc for the recorded pid (never by `ps | grep`: a broad ps match
+# would match the caller's own SSH session — a real, previously-shipped bug in
+# this project family).
+LOCKDIR="${FLEETCTL_LOCK:-/tmp/fleetctl.lock}"   # env override = testability
+LOCKED=0
+_lock() {
+  if mkdir "$LOCKDIR" 2>/dev/null; then LOCKED=1; echo $$ > "$LOCKDIR/pid"; return 0; fi
+  _op=$(cat "$LOCKDIR/pid" 2>/dev/null)
+  # Liveness via `kill -0` (POSIX, no applet needed) rather than /proc, so the
+  # check also works where /proc is absent. /proc, when present, additionally
+  # rules out pid REUSE — a recycled pid would otherwise look like a live
+  # fleetctl forever. Never `ps | grep`: a broad match would match the caller's
+  # own SSH session.
+  if [ -n "$_op" ] && kill -0 "$_op" 2>/dev/null; then
+    if [ ! -r "/proc/$_op/cmdline" ] || grep -q fleetctl "/proc/$_op/cmdline" 2>/dev/null; then
+      die "another fleetctl is already running (pid $_op). Wait for it, or remove $LOCKDIR if you are sure it is dead."
+    fi
+  fi
+  warn "clearing a stale lock from pid ${_op:-unknown}"
+  rm -rf "$LOCKDIR"
+  mkdir "$LOCKDIR" 2>/dev/null || die "could not take the lock at $LOCKDIR"
+  LOCKED=1; echo $$ > "$LOCKDIR/pid"
+}
+TMPBASE="/tmp/fleetctl.$$"
+_cleanup() { [ "$LOCKED" = "1" ] && rm -rf "$LOCKDIR"; rm -f "$TMPBASE".*; }
+trap _cleanup EXIT INT TERM
+
+# --- node specs -------------------------------------------------------------
+# A node spec is one whitespace-free token:
+#
+#   [user@]host[:port][,key=value]...
+#
+# host may be an IP or a hostname (or [v6addr]). Recognised key=value fields:
+#   port=  user=  key=<identity file>  auth=pass|key  mac=<pin>  name=<label>
+#
+# Everything is optional; anything omitted inherits the conf defaults. This is
+# ONE list rather than a list plus a side table, because a fan-out tool with
+# two sources of truth for "who is in the fleet" is a foot-gun.
+_parse_spec() {
+  _s=$1
+  SPEC_RAW=$_s
+  SPEC_USER=$FLEET_USER; SPEC_PORT=$FLEET_PORT; SPEC_KEY=""; SPEC_AUTH=""
+  SPEC_MAC=""; SPEC_NAME=""
+  # trailing key=value fields
+  case "$_s" in
+    *,*) _fields=${_s#*,}; _s=${_s%%,*} ;;
+    *)   _fields="" ;;
+  esac
+  case "$_s" in *@*) SPEC_USER=${_s%@*}; _s=${_s##*@} ;; esac
+  case "$_s" in
+    \[*\]:*) SPEC_PORT=${_s##*]:}; _s=${_s%%]:*}; _s=${_s#[} ;;   # [v6]:port
+    \[*\])   _s=${_s#[}; _s=${_s%]} ;;                            # [v6]
+    *:*:*)   : ;;                                                 # bare v6, no port
+    *:*)     SPEC_PORT=${_s##*:}; _s=${_s%:*} ;;
+  esac
+  SPEC_HOST=$_s
+  if [ -n "$_fields" ]; then
+    for _f in $(echo "$_fields" | tr ',' ' '); do
+      case "$_f" in
+        port=*) SPEC_PORT=${_f#port=} ;;
+        user=*) SPEC_USER=${_f#user=} ;;
+        key=*)  SPEC_KEY=${_f#key=} ;;
+        auth=*) SPEC_AUTH=${_f#auth=} ;;
+        mac=*)  SPEC_MAC=$(echo "${_f#mac=}" | tr 'a-z' 'A-Z') ;;
+        name=*) SPEC_NAME=${_f#name=} ;;
+        '')     : ;;
+        *)      warn "$SPEC_RAW: ignoring unknown field '$_f'" ;;
+      esac
+    done
+  fi
+  [ -n "$SPEC_NAME" ] || SPEC_NAME=$SPEC_HOST
+  # auth resolution: an explicit per-node key/auth wins, else the conf default.
+  SPEC_PASS=0
+  case "$SPEC_AUTH" in
+    pass|password) SPEC_PASS=1 ;;
+    key|'')        : ;;
+    *)             SPEC_KEY=$SPEC_AUTH ;;   # tolerate auth=<path> as a key path
+  esac
+  if [ "$SPEC_PASS" = "0" ] && [ -z "$SPEC_KEY" ]; then
+    if [ -f "$FLEET_KEY" ]; then SPEC_KEY=$FLEET_KEY
+    elif [ "$FLEET_ALLOW_PASSWORD" = "1" ]; then SPEC_PASS=1
+    fi
+  fi
+}
+
+# --- password fallback (opt-in, discouraged, never stored) -------------------
+# Prompted once per distinct password scope, kept in this process's memory
+# only. Storing it would put a plaintext mesh-admin credential on flash.
+_have_tty() { ( : < /dev/tty ) 2>/dev/null; }
+_password_for() {
+  # Reached only when the spec resolved to password auth AND that was permitted
+  # (_probe rejects the mismatch per node, so this is not a second gate).
+  _slot="FLEET_PW_$(echo "$1" | sed 's/[^A-Za-z0-9]/_/g')"
+  eval "_pw=\${$_slot:-}"
+  if [ -z "$_pw" ]; then
+    # Never block waiting for input that can never arrive: a cron-driven or
+    # piped invocation has no TTY, and a prompt there would hang forever.
+    _have_tty || die "password auth needs a terminal, and this invocation has no TTY (cron/pipe?). Use key auth: fleetctl setup"
+    echo "FLEET_ALLOW_PASSWORD — using password auth for $1. This is the discouraged path:" >&2
+    echo "  the mesh admin password transits process environments on every hop." >&2
+    echo "  Set up the key instead; it is one paste: fleetctl setup" >&2
+    printf 'password for %s@%s: ' "$SPEC_USER" "$1" >&2
+    # stty acts on ITS stdin — redirect it, or a piped invocation silently echoes
+    stty -echo < /dev/tty 2>/dev/null
+    read -r _pw < /dev/tty
+    stty echo < /dev/tty 2>/dev/null
+    echo >&2
+    eval "$_slot=\$_pw"
+  fi
+  DROPBEAR_PASSWORD=$_pw; export DROPBEAR_PASSWORD
+}
+
+# --- SSH transport ----------------------------------------------------------
+# busybox applet sets are trimmed and vary per build: probe with `which` (this
+# busybox has NO `command` builtin — `command -v` fails with "command: not
+# found", a false negative that reads as "missing"). Same discipline for
+# dbclient's OWN flags: an unknown flag makes dbclient exit before connecting,
+# so -K/-M are used only if this build advertises them.
+SSH_BIN=""; SSH_FLAVOR=""; DB_HAS_K=0; DB_HAS_M=0
+_detect_ssh() {
+  [ -n "$SSH_BIN" ] && return 0
+  if which dbclient >/dev/null 2>&1; then SSH_BIN=dbclient; SSH_FLAVOR=dropbear
+  elif which ssh >/dev/null 2>&1; then
+    SSH_BIN=ssh
+    # On Merlin `ssh` IS dropbear; only Entware/OpenSSH announces itself.
+    if ssh -V 2>&1 | grep -qi openssh; then SSH_FLAVOR=openssh; else SSH_FLAVOR=dropbear; fi
+  else
+    return 1
+  fi
+  if [ "$SSH_FLAVOR" = "dropbear" ]; then
+    _h=$("$SSH_BIN" -h 2>&1)
+    echo "$_h" | grep -q '^-K ' && DB_HAS_K=1     # keepalive => dead peers are noticed
+    echo "$_h" | grep -q '^-M ' && DB_HAS_M=1     # in-client max session duration
+  fi
+  # Our own known_hosts, so TOFU state is fleetctl's and not root's. Kept on
+  # /jffs because it must survive reboots — it is a few hundred bytes, written
+  # once per node, which is within the flash-wear rule. dropbear finds it via
+  # $HOME, so HOME is repointed for this whole process (a `HOME=x func` prefix
+  # would NOT be reliably scoped: POSIX leaves assignments before a function
+  # call persisting in the shell, so scoping it that way only looks local).
+  [ -d "$FLEET_HOME/.ssh" ] || mkdir -p "$FLEET_HOME/.ssh" 2>/dev/null
+  HOME="$FLEET_HOME"; export HOME
+  return 0
+}
+
+# _ssh_opts <max_seconds> — NB: the result is deliberately word-split by the
+# caller, so FLEET_KEY / key= paths must not contain spaces (documented).
+_ssh_opts() {
+  if [ "$SSH_FLAVOR" = "openssh" ]; then
+    o="-p $SPEC_PORT -o ConnectTimeout=10 -o UserKnownHostsFile=$FLEET_HOME/.ssh/known_hosts"
+    [ "$SPEC_PASS" = "1" ] || o="$o -o BatchMode=yes"
+    [ "$FLEET_STRICT_HOSTKEY" = "1" ] || o="$o -o StrictHostKeyChecking=accept-new"
+    [ -n "$SPEC_KEY" ] && [ -f "$SPEC_KEY" ] && o="$o -o IdentitiesOnly=yes -i $SPEC_KEY"
+  else
+    o="-T -p $SPEC_PORT"
+    # TOFU: -y accepts an UNKNOWN host key and records it; a CHANGED key is
+    # still fatal (that needs `-y -y`, which we never pass). On a LAN node a
+    # changed key means a firmware reflash or someone spoofing the address —
+    # the user must decide which, so we surface it instead of accepting it.
+    [ "$FLEET_STRICT_HOSTKEY" = "1" ] || o="$o -y"
+    [ "$DB_HAS_K" = "1" ] && o="$o -K 10"
+    # -M is a backstop set just ABOVE our own watchdog, so the watchdog (which
+    # can tell us it fired) is what normally trips, and -M only covers the case
+    # where the watchdog itself fails.
+    [ "$DB_HAS_M" = "1" ] && [ -n "$1" ] && o="$o -M $(($1 + 5))"
+    [ -n "$SPEC_KEY" ] && [ -f "$SPEC_KEY" ] && o="$o -i $SPEC_KEY"
+  fi
+  echo "$o"
+}
+
+# _with_timeout <secs> <cmd...>
+# There is NO `timeout` applet on this firmware (verified on RT-BE92U 3006), so
+# the cap is a watchdog we run ourselves: background the child, background a
+# sleeper that kills it, whichever finishes first wins. The sleeper touches a
+# marker before killing so a timeout is distinguishable from an ordinary
+# non-zero exit. Kills are by known pid ONLY — never by `ps | grep`, which
+# would match the caller's own SSH session.
+#
+# RUN_STDIN is why the child's stdin is passed EXPLICITLY: POSIX gives an
+# asynchronous ("&") command /dev/null as stdin unless it is explicitly
+# redirected. Without this, `push` would happily stream nothing and write an
+# empty file over the destination on every node — silently, exit 0. Caught by
+# the test suite; do not "simplify" it away.
+TIMED_OUT=0
+RUN_STDIN=/dev/null
+_with_timeout() {
+  _cap=$1; shift
+  _mark="$TMPBASE.timedout"; rm -f "$_mark"; TIMED_OUT=0
+  "$@" < "$RUN_STDIN" &
+  _cpid=$!
+  ( sleep "$_cap"; kill "$_cpid" 2>/dev/null && : > "$_mark" ) &
+  _wpid=$!
+  wait "$_cpid"; _rc=$?
+  kill "$_wpid" 2>/dev/null
+  wait "$_wpid" 2>/dev/null
+  [ -f "$_mark" ] && { TIMED_OUT=1; rm -f "$_mark"; }
+  return $_rc
+}
+
+# _run_on <max_seconds> <command-string>   (uses the SPEC_* of the current node)
+_run_on() {
+  _detect_ssh || die "no SSH client found (looked for dbclient, ssh)"
+  [ "$SPEC_PASS" = "1" ] && _password_for "$SPEC_HOST"
+  _cap=$1
+  # shellcheck disable=SC2086  — word splitting of the option list is intended
+  _with_timeout "$_cap" "$SSH_BIN" $(_ssh_opts "$_cap") "$SPEC_USER@$SPEC_HOST" "$2"
+}
+
+# --- probe / identity -------------------------------------------------------
+# Sets: P_OK P_MODEL P_JFFS P_DIR P_MACS P_REASON
+_probe() {
+  P_OK=0; P_MODEL=""; P_JFFS=""; P_DIR=""; P_MACS=""; P_REASON=""
+  # A per-node auth mismatch is that NODE's problem, not grounds to abort the
+  # whole fan-out (continue-on-error: a half-run mesh with no record of where
+  # it stopped is worse than a full run with failures listed).
+  if [ "$SPEC_PASS" = "1" ] && [ "$FLEET_ALLOW_PASSWORD" != "1" ]; then
+    P_REASON="spec requests password auth, but FLEET_ALLOW_PASSWORD=0 in $CONF (key auth is the supported path: fleetctl setup)"
+    return 1
+  fi
+  _err="$TMPBASE.err"; _out="$TMPBASE.probe"
+  _run_on "$FLEET_PROBE_TIMEOUT" "$PROBE" > "$_out" 2> "$_err"
+  _rc=$?
+  if [ "$TIMED_OUT" = "1" ]; then P_REASON="timed out after ${FLEET_PROBE_TIMEOUT}s"; return 1; fi
+  _line=$(grep '__fleetprobe__' "$_out" 2>/dev/null | head -1)
+  if [ -z "$_line" ]; then
+    if grep -qi 'host key\|HOST KEY' "$_err" 2>/dev/null; then
+      P_REASON="HOST KEY MISMATCH — this address answered with a different SSH host key than last time. A firmware reflash explains it; so does someone else holding that address now. Verify, then remove the stale entry from $FLEET_HOME/.ssh/known_hosts"
+    elif grep -qi 'denied\|authentication' "$_err" 2>/dev/null; then
+      P_REASON="SSH auth failed (is the key pasted into the router GUI's SSH authentication key field yet?)"
+    else
+      P_REASON="unreachable: $(head -1 "$_err" 2>/dev/null | cut -c1-120)"
+      [ "$_rc" = "0" ] && P_REASON="connected, but the probe produced no answer (is this an ASUS unit?)"
+    fi
+    return 1
+  fi
+  P_MODEL=$(echo "$_line" | tr ' ' '\n' | grep '^model=' | cut -d= -f2-)
+  P_JFFS=$(echo  "$_line" | tr ' ' '\n' | grep '^jffs='  | cut -d= -f2-)
+  P_DIR=$(echo   "$_line" | tr ' ' '\n' | grep '^dir='   | cut -d= -f2-)
+  P_MACS=$(echo  "$_line" | tr ' ' '\n' | grep '^macs='  | cut -d= -f2- | tr 'a-z' 'A-Z')
+  P_OK=1
+  return 0
+}
+
+# Eligibility gate for anything that touches a node's /jffs. Verified
+# signature: a STOCK (non-Merlin) AiMesh node returns an empty jffs2_scripts,
+# so it is correctly reported ineligible — while remaining a perfectly good
+# `run` target (stock nodes still answer nvram, wl, ...).
+_eligible() { [ "$P_JFFS" = "1" ] && [ "$P_DIR" = "yes" ]; }
+
+SELF_MACS=""
+_self_macs() {
+  [ -n "$SELF_MACS" ] && return 0
+  for v in lan_hwaddr label_mac et0macaddr et1macaddr; do
+    x=$(nvram get "$v" 2>/dev/null); [ -n "$x" ] && SELF_MACS="$SELF_MACS$x,"
+  done
+  SELF_MACS=$(echo "$SELF_MACS" | tr 'a-z' 'A-Z')
+}
+_is_self() {
+  # cheap check first: our own LAN address, or the loopback aliases
+  _lan=$(nvram get lan_ipaddr 2>/dev/null)
+  case "$SPEC_HOST" in localhost|127.0.0.1) return 0 ;; esac
+  [ -n "$_lan" ] && [ "$SPEC_HOST" = "$_lan" ] && return 0
+  # then by identity, which also catches "the controller under another name"
+  _self_macs
+  [ -n "$P_MACS" ] && [ -n "$SELF_MACS" ] || return 1
+  for m in $(echo "$P_MACS" | tr ',' ' '); do
+    case ",$SELF_MACS," in *",$m,"*) return 0 ;; esac
+  done
+  return 1
+}
+_pin_matches() {
+  [ -n "$SPEC_MAC" ] || return 1
+  for m in $(echo "$P_MACS" | tr ',' ' '); do
+    [ "$m" = "$SPEC_MAC" ] && return 0
+  done
+  return 1
+}
+
+# --- per-node result summary ------------------------------------------------
+# A failed node must never look like a successful run: every node lands in the
+# summary, and fleetctl's exit code is non-zero if any of them failed.
+SUMMARY="$TMPBASE.summary"
+_result() { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$SUMMARY"; }
+_print_summary() {
+  echo
+  echo "--- summary ---"
+  [ -f "$SUMMARY" ] || { echo "  (no nodes processed)"; return 1; }
+  _ok=0; _fail=0; _skip=0
+  while IFS="$(printf '\t')" read -r h st reason; do
+    case "$st" in
+      OK)      _ok=$((_ok+1));     printf '  OK       %-18s %s\n' "$h" "$reason" ;;
+      SKIPPED) _skip=$((_skip+1)); printf '  SKIPPED  %-18s %s\n' "$h" "$reason" ;;
+      *)       _fail=$((_fail+1)); printf '  FAIL     %-18s %s\n' "$h" "$reason" ;;
+    esac
+  done < "$SUMMARY"
+  echo "  ($_ok ok, $_fail failed, $_skip skipped)"
+  logger -t "$TAG" "$VERB: ok=$_ok fail=$_fail skip=$_skip" 2>/dev/null
+  [ "$_fail" = "0" ]
+}
+
+# _nodes_or_die — the runtime fleet, always from the conf (never from live
+# discovery: a discovered list drifts, and a fan-out tool must aim at a stable,
+# user-owned target list).
+_nodes_or_die() {
+  [ -n "$FLEET_NODES" ] || die "FLEET_NODES is empty in $CONF — run 'fleetctl discover' for a conf-ready line, or pass --nodes '<spec> ...'"
+}
+
+# _require_target <mutating?> — shared gate: probe, identify, decide.
+# Sets GATE=go|skip|fail and GATE_REASON. `run` is deliberately laxer than the
+# mutating verbs: a read-only command on a re-IP'd host is a nuisance, whereas
+# `curl … | sh` as root on one is a compromise.
+_require_target() {
+  _mut=$1; GATE=fail; GATE_REASON=""
+  if ! _probe; then GATE_REASON="$P_REASON"; return 1; fi
+  if _is_self && [ "$INCLUDE_SELF" != "1" ]; then
+    GATE=skip; GATE_REASON="this is the controller itself (--include-self to include it)"; return 1
+  fi
+  if [ "$_mut" = "1" ]; then
+    if [ -z "$P_MODEL" ]; then
+      GATE_REASON="refusing: the host at this address did not identify as an ASUS unit"; return 1
+    fi
+    if [ -n "$SPEC_MAC" ]; then
+      if ! _pin_matches; then
+        GATE_REASON="refusing: MAC pin $SPEC_MAC does not match this host ($P_MODEL). DHCP may have moved the address — re-run 'fleetctl discover'"; return 1
+      fi
+    elif [ "$ALLOW_UNPINNED" != "1" ]; then
+      GATE_REASON="refusing: no MAC pin for this node, and this verb runs as root on it. Add mac=… (see 'fleetctl discover'), or pass --allow-unpinned"; return 1
+    fi
+    if ! _eligible; then
+      # A verdict without a remediation is a dead end for the user — but an
+      # AiMesh node has no web UI of its own, so the honest instruction is the
+      # one in the README, not a confident GUI path that does not exist.
+      GATE=skip
+      GATE_REASON="not Merlin-eligible ($P_MODEL: jffs2_scripts=${P_JFFS:-empty}, /jffs/scripts=$P_DIR) — that unit needs Merlin firmware with JFFS custom scripts enabled; see README 'Enabling JFFS custom scripts on a node'"
+      return 1
+    fi
+  fi
+  GATE=go; return 0
+}
+
+# --- verbs ------------------------------------------------------------------
+
+cmd_setup() {
+  which dropbearkey >/dev/null 2>&1 || die "dropbearkey not found — is this an Asuswrt-Merlin router?"
+  if [ -f "$FLEET_KEY" ] && [ "$1" != "--force" ]; then
+    echo "Key already exists: $FLEET_KEY  (use 'fleetctl setup --force' to replace it)"
+  else
+    if [ -f "$FLEET_KEY" ]; then
+      echo "Replacing $FLEET_KEY — the OLD public key stays authorized until you"
+      echo "remove it from the router GUI's key field. Do that after this works."
+      rm -f "$FLEET_KEY" "$FLEET_KEY.pub"
+    fi
+    # fleetctl's OWN path — deliberately NOT /jffs/.ssh/, which holds the
+    # firmware's sshd HOST keys. File creation only; no nvram is written.
+    dropbearkey -t ed25519 -f "$FLEET_KEY" >/dev/null 2>&1 ||
+      dropbearkey -t rsa -s 3072 -f "$FLEET_KEY" >/dev/null 2>&1 ||
+      die "key generation failed (dropbearkey)"
+    chmod 600 "$FLEET_KEY"
+    echo "Generated $FLEET_KEY"
+  fi
+  pub=$(dropbearkey -y -f "$FLEET_KEY" 2>/dev/null | grep -E '^(ssh|ecdsa)-' | head -1)
+  [ -n "$pub" ] || die "could not read the public key out of $FLEET_KEY"
+  echo "$pub" > "$FLEET_KEY.pub"; chmod 644 "$FLEET_KEY.pub"
+  cat <<EOF
+
+--- copy the line below (all of it, one line) -------------------------------
+$pub
+-----------------------------------------------------------------------------
+
+Next: authorize it on the mesh — ONE paste, no per-node steps.
+
+  1. Router GUI -> Administration -> System -> "SSH Authentication key"
+  2. Paste the line above on its OWN line, keeping any keys already there.
+  3. Apply.
+
+AiMesh syncs that field byte-for-byte to every node, current AND future, so
+every node accepts this key without being touched individually. fleetctl does
+not write it for you on purpose: authorized-keys is the one setting that can
+lock you out of your own mesh, so it stays a human action in the GUI.
+(Side effect: the router authorizes its own key. Harmless.)
+
+Then:  fleetctl discover   ->  paste FLEET_NODES into $CONF  ->  fleetctl nodes
+EOF
+}
+
+cmd_discover() {
+  raw=$(nvram get cfg_device_list 2>/dev/null)
+  if [ -z "$raw" ]; then
+    echo "nvram cfg_device_list is empty."
+    echo
+    echo "That means this router is not the AiMesh controller, or it has no nodes,"
+    echo "or this firmware keeps the list elsewhere. Discovery is a convenience —"
+    echo "fleetctl works fully without it. Populate $CONF by hand:"
+    echo
+    echo '  FLEET_NODES="192.168.1.2 192.168.1.3"'
+    exit 1
+  fi
+  # Format (verified on 3006): records '<'-separated, fields '>'-separated:
+  #   <hostname>ip>mac>role   —  role 1 = the controller itself, 0 = a node.
+  # Parse DEFENSIVELY: firmware generations differ within one mesh (3004 nodes
+  # under a 3006 controller are in the field), so an unrecognised shape must
+  # print the raw value and hand over to manual config, never hard-fail.
+  # NB: the parse loop is fed by a heredoc, NOT wrapped in $( … ) — bash 3.2
+  # (macOS, where this repo's `sh -n` lint runs) mis-parses a `case` inside a
+  # command substitution. Keep case statements out of $( ).
+  cands=""
+  _recs=$(echo "$raw" | tr '<' '\n')
+  while IFS='>' read -r h ip mac role _rest; do
+    case "$ip" in ''|*[!0-9.]*) continue ;; esac      # field 2 must look like an IP
+    [ "$role" = "1" ] && continue                      # the controller lists itself
+    cands="$cands$ip|${h:-node}|$(echo "$mac" | tr 'a-z' 'A-Z')
+"
+  done <<EOF
+$_recs
+EOF
+  if [ -z "$cands" ]; then
+    echo "fleetctl could not parse any node out of cfg_device_list."
+    echo
+    echo "raw value (unrecognised format — please report it):"
+    echo "  $raw"
+    echo
+    echo "Populate $CONF by hand instead:"
+    echo '  FLEET_NODES="192.168.1.2 192.168.1.3"'
+    exit 1
+  fi
+  echo "fleetctl $VERSION — AiMesh nodes known to this controller:"
+  echo
+  specline=""
+  # A read-loop (not `for c in $cands`) so a node name containing a space cannot
+  # split into two bogus rows — and fed by a heredoc rather than a pipe, so the
+  # loop runs in THIS shell and $specline survives it.
+  while IFS='|' read -r ip label mac; do
+    [ -n "$ip" ] || continue
+    _parse_spec "$ip"
+    if _probe; then
+      if _eligible; then
+        printf '  %-15s %-14s %-10s auth: ok    merlin: yes  (run + install)\n' "$ip" "$label" "$P_MODEL"
+      else
+        printf '  %-15s %-14s %-10s auth: ok    merlin: no   (run only)\n' "$ip" "$label" "$P_MODEL"
+      fi
+    else
+      printf '  %-15s %-14s %-10s auth: FAIL  %s\n' "$ip" "$label" "-" "$(echo "$P_REASON" | cut -c1-60)"
+    fi
+    label=$(echo "$label" | tr ' ,' '__')             # specs are whitespace-free
+    if [ -n "$mac" ]; then specline="$specline$ip,mac=$mac,name=$label "
+    else specline="$specline$ip,name=$label "; fi
+  done <<EOF
+$cands
+EOF
+  cat <<EOF
+
+Paste this into $CONF:
+
+FLEET_NODES="$(echo "$specline" | sed 's/ *$//')"
+
+The mac= pins matter: FLEET_NODES holds addresses, DHCP moves addresses, and
+'install'/'push' run as root on whatever answers. fleetctl verifies the pin
+before anything mutating, and refuses when it does not match.
+EOF
+}
+
+cmd_nodes() {
+  _nodes_or_die
+  echo "fleetctl $VERSION — configured nodes (default user: $FLEET_USER, port: $FLEET_PORT):"
+  echo
+  rc=0
+  for spec in $FLEET_NODES; do
+    _parse_spec "$spec"
+    if _probe; then
+      _pinstate="unpinned"
+      if [ -n "$SPEC_MAC" ]; then _pin_matches && _pinstate="pin ok" || { _pinstate="PIN MISMATCH"; rc=1; }; fi
+      _self=""; _is_self && _self=" [controller]"
+      if _eligible; then
+        printf '  %-18s %-10s auth: ok    merlin: yes  %s%s\n' "$SPEC_NAME" "$P_MODEL" "$_pinstate" "$_self"
+      else
+        printf '  %-18s %-10s auth: ok    merlin: no   %s%s  (run only)\n' "$SPEC_NAME" "$P_MODEL" "$_pinstate" "$_self"
+      fi
+    else
+      printf '  %-18s %-10s auth: FAIL  %s\n' "$SPEC_NAME" "-" "$P_REASON"
+      rc=1
+    fi
+  done
+  exit $rc
+}
+
+cmd_run() {
+  [ -n "$1" ] || die "usage: fleetctl run <command...>"
+  _nodes_or_die
+  _lock
+  cmdstr="$*"
+  [ "$DRY_RUN" = "1" ] && echo "DRY RUN — nothing will be executed."
+  echo "fleetctl $VERSION — running on every configured node:"
+  echo "  \$ $cmdstr"
+  out="$TMPBASE.out"
+  for spec in $FLEET_NODES; do
+    _parse_spec "$spec"
+    echo
+    echo "=== $SPEC_NAME ($SPEC_USER@$SPEC_HOST:$SPEC_PORT) ==="
+    if ! _require_target 0; then
+      echo "  $GATE_REASON"
+      [ "$GATE" = "skip" ] && _result "$SPEC_NAME" SKIPPED "$GATE_REASON" || _result "$SPEC_NAME" FAIL "$GATE_REASON"
+      continue
+    fi
+    if [ "$DRY_RUN" = "1" ]; then
+      echo "  would run: $cmdstr"
+      _result "$SPEC_NAME" SKIPPED "dry run"
+      continue
+    fi
+    # Buffered per node (in /tmp = RAM, never /jffs = flash): a pipeline would
+    # hide the remote exit status, and busybox sh has no PIPESTATUS. Serial and
+    # deterministic — meshes are 2-4 units, and the router is also routing.
+    _run_on "$FLEET_RUN_TIMEOUT" "$cmdstr" > "$out" 2>&1; s=$?
+    [ -s "$out" ] && sed "s/^/[$SPEC_NAME] /" "$out"
+    if [ "$TIMED_OUT" = "1" ]; then
+      _result "$SPEC_NAME" FAIL "timed out after ${FLEET_RUN_TIMEOUT}s (FLEET_RUN_TIMEOUT)"
+    elif [ "$s" = "0" ]; then
+      _result "$SPEC_NAME" OK "exit 0"
+    else
+      _result "$SPEC_NAME" FAIL "exit $s"
+    fi
+  done
+  _print_summary
+}
+
+cmd_push() {
+  src=$1; dest=$2
+  [ -n "$src" ] && [ -n "$dest" ] || die "usage: fleetctl push <local-file> <remote-path>"
+  [ -f "$src" ] || die "no such file: $src"
+  case "$dest" in /*) : ;; *) die "remote path must be absolute: $dest" ;; esac
+  case "$dest" in *\'*) die "remote path must not contain a single quote" ;; esac
+  _nodes_or_die
+  _lock
+  # `cat | ssh 'cat > tmp && mv'` rather than scp: it needs only cat on the far
+  # side (no scp/sftp binary, no dropbear scp quirks), and the temp+mv makes the
+  # replacement atomic so an interrupted push cannot leave a half-written file
+  # in place of a working one.
+  mode=644; [ -x "$src" ] && mode=755
+  [ "$DRY_RUN" = "1" ] && echo "DRY RUN — nothing will be written."
+  echo "fleetctl $VERSION — pushing $src -> $dest (mode $mode)"
+  for spec in $FLEET_NODES; do
+    _parse_spec "$spec"
+    echo
+    echo "=== $SPEC_NAME ($SPEC_USER@$SPEC_HOST:$SPEC_PORT) ==="
+    if ! _require_target 1; then
+      echo "  $GATE_REASON"
+      [ "$GATE" = "skip" ] && _result "$SPEC_NAME" SKIPPED "$GATE_REASON" || _result "$SPEC_NAME" FAIL "$GATE_REASON"
+      continue
+    fi
+    if [ "$DRY_RUN" = "1" ]; then
+      echo "  would write $dest (mode $mode, $(wc -c < "$src" | tr -d ' ') bytes)"
+      _result "$SPEC_NAME" SKIPPED "dry run"
+      continue
+    fi
+    # The temp name is generated HERE (our pid) rather than remotely: the
+    # destination path has to be single-quoted for the remote shell, and a
+    # remote $$ inside single quotes would never expand. The lock guarantees
+    # only one fleetctl is pushing at a time, so our pid is unique enough.
+    rtmp="$dest.fleetctl.$$"
+    rcmd="cat > '$rtmp' && chmod $mode '$rtmp' && mv '$rtmp' '$dest'"
+    RUN_STDIN="$src"                      # see _with_timeout: async stdin is /dev/null
+    _run_on "$FLEET_RUN_TIMEOUT" "$rcmd" > "$TMPBASE.out" 2>&1; s=$?
+    RUN_STDIN=/dev/null
+    [ -s "$TMPBASE.out" ] && sed "s/^/[$SPEC_NAME] /" "$TMPBASE.out"
+    if [ "$TIMED_OUT" = "1" ]; then _result "$SPEC_NAME" FAIL "timed out after ${FLEET_RUN_TIMEOUT}s"
+    elif [ "$s" = "0" ]; then _result "$SPEC_NAME" OK "wrote $dest"
+    else _result "$SPEC_NAME" FAIL "exit $s"; fi
+  done
+  _print_summary
+}
+
+cmd_install() {
+  url=$1; shift
+  [ -n "$url" ] || die "usage: fleetctl install <installer-url> [args...]"
+  case "$url" in
+    http://*|https://*) : ;;
+    *) die "installer must be an http(s) URL: $url" ;;
+  esac
+  case "$url" in *\'*) die "URL must not contain a single quote" ;; esac
+  _nodes_or_die
+  _lock
+  args="$*"
+  [ "$DRY_RUN" = "1" ] && echo "DRY RUN — nothing will be installed."
+  echo "fleetctl $VERSION — installing on every eligible node:"
+  echo "  url:  $url"
+  [ -n "$args" ] && echo "  args: $args"
+  # Download to a file and run it, rather than curl|sh: it separates "download
+  # failed" from "install failed", and it leaves the installer's stdin free
+  # (an installer arriving ON stdin cannot read stdin — see the addon contract
+  # in the README).
+  for spec in $FLEET_NODES; do
+    _parse_spec "$spec"
+    echo
+    echo "=== $SPEC_NAME ($SPEC_USER@$SPEC_HOST:$SPEC_PORT) ==="
+    if ! _require_target 1; then
+      echo "  $GATE_REASON"
+      [ "$GATE" = "skip" ] && _result "$SPEC_NAME" SKIPPED "$GATE_REASON" || _result "$SPEC_NAME" FAIL "$GATE_REASON"
+      continue
+    fi
+    if [ "$DRY_RUN" = "1" ]; then
+      echo "  would run: curl -fsSL '$url' -o /tmp/… && sh /tmp/… $args"
+      _result "$SPEC_NAME" SKIPPED "dry run"
+      continue
+    fi
+    rcmd="t=/tmp/fleetctl-install.\$\$.sh; curl -fsSL '$url' -o \"\$t\" || { echo 'fleetctl: installer download failed (does this node have internet access?)'; exit 90; }; sh \"\$t\" $args; _rc=\$?; rm -f \"\$t\"; exit \$_rc"
+    _run_on "$FLEET_INSTALL_TIMEOUT" "$rcmd" > "$TMPBASE.out" 2>&1; s=$?
+    # NEVER reduce a node to a checkmark: an addon can install cleanly, exit 0,
+    # and still be silently inert — the installer's own tail is the only place
+    # that shows. Swallowing it turns one silent misconfiguration into N
+    # invisible ones, all self-reporting success.
+    [ -s "$TMPBASE.out" ] && sed "s/^/[$SPEC_NAME] /" "$TMPBASE.out"
+    if [ "$TIMED_OUT" = "1" ]; then _result "$SPEC_NAME" FAIL "timed out after ${FLEET_INSTALL_TIMEOUT}s (FLEET_INSTALL_TIMEOUT)"
+    elif [ "$s" = "0" ]; then _result "$SPEC_NAME" OK "installer exited 0"
+    elif [ "$s" = "90" ]; then _result "$SPEC_NAME" FAIL "could not download the installer"
+    else _result "$SPEC_NAME" FAIL "installer exited $s"; fi
+  done
+  echo
+  echo "Read the per-node output above, not just the summary: an installer can"
+  echo "exit 0 and still have landed in an inert configuration."
+  _print_summary
+}
+
+cmd_health() {
+  rc=0
+  ok()   { echo "  ok:   $1"; }
+  bad()  { echo "  FAIL: $1"; rc=1; }
+  note() { echo "  warn: $1"; }
+  echo "fleetctl $VERSION health check"
+
+  [ "$(nvram get jffs2_scripts 2>/dev/null)" = "1" ] && ok "JFFS custom scripts enabled" || bad "JFFS custom scripts disabled (nvram jffs2_scripts)"
+  # NB: no `command` builtin on this busybox — probe with `which`
+  if _detect_ssh; then
+    ok "SSH client: $SSH_BIN ($SSH_FLAVOR)"
+    [ "$SSH_FLAVOR" = "dropbear" ] && { [ "$DB_HAS_K" = "1" ] && ok "dbclient keepalive (-K) supported" || note "dbclient has no -K: a node that dies mid-command relies on the watchdog alone"; }
+  else
+    bad "no SSH client found (dbclient/ssh) — fan-out impossible"
+  fi
+  which dropbearkey >/dev/null 2>&1 && ok "dropbearkey available" || note "dropbearkey missing — 'fleetctl setup' cannot generate a key here"
+  which curl >/dev/null 2>&1 && ok "curl available (needed by 'update')" || note "curl missing — 'update' will not work"
+  [ -d "$FLEET_HOME/.ssh" ] && ok "known_hosts dir: $FLEET_HOME/.ssh" || note "no $FLEET_HOME/.ssh yet (created on first connection)"
+
+  if [ -f "$CONF" ]; then
+    sh -n "$CONF" 2>/dev/null && ok "conf parses: $CONF" || bad "conf has syntax errors: $CONF"
+  else
+    note "no conf at $CONF — using built-in defaults"
+  fi
+
+  if [ -f "$FLEET_KEY" ]; then
+    ok "key present: $FLEET_KEY"
+    case "$(ls -l "$FLEET_KEY" 2>/dev/null | cut -c1-10)" in
+      -rw-------) ok "key permissions are 0600" ;;
+      *) note "key is group/other-readable — chmod 600 $FLEET_KEY" ;;
+    esac
+    [ -f "$FLEET_KEY.pub" ] && ok "public key present: $FLEET_KEY.pub" || note "no $FLEET_KEY.pub — run 'fleetctl setup' to re-derive it"
+  elif [ "$FLEET_ALLOW_PASSWORD" = "1" ]; then
+    note "no key ($FLEET_KEY) — falling back to the discouraged password path"
+  else
+    bad "no key at $FLEET_KEY and FLEET_ALLOW_PASSWORD=0 — run 'fleetctl setup'"
+  fi
+  [ "$FLEET_ALLOW_PASSWORD" = "1" ] && note "FLEET_ALLOW_PASSWORD=1 — password auth permitted; it is never stored, but it does transit process environments"
+  [ "$FLEET_STRICT_HOSTKEY" = "1" ] && ok "strict host-key checking on" || note "unknown host keys are accepted on first contact (TOFU); a CHANGED key is always refused"
+
+  if [ -z "$FLEET_NODES" ]; then
+    note "FLEET_NODES is empty — run 'fleetctl discover' for a conf-ready line"
+  else
+    ok "nodes configured: $FLEET_NODES"
+    for spec in $FLEET_NODES; do
+      _parse_spec "$spec"
+      if _probe; then
+        _p=""; [ -n "$SPEC_MAC" ] && _p=", pin ok"
+        if [ -n "$SPEC_MAC" ] && ! _pin_matches; then
+          bad "$SPEC_NAME: MAC pin does not match the host answering at $SPEC_HOST — 'install'/'push' will refuse it"
+        elif _is_self && [ "$INCLUDE_SELF" != "1" ]; then
+          note "$SPEC_NAME: this is the controller itself — excluded from fan-out unless --include-self"
+        elif _eligible; then
+          ok "$SPEC_NAME ($P_MODEL): auth ok, Merlin-eligible$_p"
+        else
+          note "$SPEC_NAME ($P_MODEL): auth ok, NOT Merlin-eligible$_p — 'run' works, 'install'/'push' will be skipped. See README 'Enabling JFFS custom scripts on a node'"
+        fi
+        [ -z "$SPEC_MAC" ] && note "$SPEC_NAME: no mac= pin — 'install'/'push' will refuse it (re-run 'fleetctl discover' for a pinned line)"
+      else
+        bad "$SPEC_NAME: $P_REASON"
+      fi
+    done
+  fi
+
+  if [ $rc -eq 0 ]; then echo "healthy."; else echo "PROBLEMS FOUND — see FAIL lines above."; fi
+  exit $rc
+}
+
+cmd_update() {
+  echo "fleetctl $VERSION — fetching the latest installer from GitHub (main)..."
+  # ?cb= busts the raw.githubusercontent.com CDN cache (the query string is
+  # part of its cache key). raw still lags a push by up to ~5 min regardless,
+  # so a "nothing changed" result right after a push means wait, not broken.
+  curl -fsSL "$REPO_RAW/install.sh?cb=$(date +%s)" -o "$UPDATE_TMP" ||
+    die "download failed — does the router have internet access?"
+  # exec, don't run-and-return: the installer overwrites THIS script, and
+  # busybox sh reads scripts incrementally, so a running script must never have
+  # its file rewritten under it. exec replaces this process with the installer
+  # (running from RAM) first.
+  exec sh "$UPDATE_TMP"
+}
+
+cmd_uninstall() {
+  echo "Removing fleetctl from this router."
+  echo
+  echo "REMINDER — fleetctl cannot undo trust it never created:"
+  echo "  the public key you pasted into the GUI is still authorized on this"
+  echo "  router and on every mesh node. Remove it in the router GUI"
+  echo "  (Administration -> System -> SSH Authentication key) if you are done"
+  echo "  with it; AiMesh propagates the removal to the nodes."
+  echo
+  echo "  Addons installed on nodes are NOT removed. Roll those back first:"
+  echo "    fleetctl install <installer-url> uninstall"
+  echo
+  rm -f "$FLEET_KEY" "$FLEET_KEY.pub" "$CONF" "$UPDATE_TMP"
+  rm -rf "$FLEET_HOME"
+  logger -t "$TAG" "uninstalled" 2>/dev/null
+  echo "fleetctl uninstalled (key, conf, known_hosts, and tool removed)."
+  rm -f "$0"
+}
+
+usage() {
+  cat <<EOF
+fleetctl $VERSION — AiMesh fleet orchestration for Asuswrt-Merlin
+
+usage: fleetctl [flags] <verb> [args]
+
+verbs:
+  setup [--force]          generate the client keypair, print the pubkey to paste
+  discover                 list AiMesh nodes this controller knows about
+  nodes                    status of every node configured in fleetctl.conf
+  run <command...>         run a command on every node (read-only gate)
+  push <local> <remote>    copy a file to every eligible node (atomic)
+  install <url> [args...]  run an addon installer on every eligible node;
+                           args pass through, so rollback is:
+                             fleetctl install <url> uninstall
+  health                   self-check (non-zero exit on any FAIL)
+  update                   self-update from GitHub (main)
+  uninstall                remove fleetctl from this router
+
+flags (before the verb):
+  --dry-run                probe and report, execute nothing
+  --nodes "<spec> ..."     override FLEET_NODES for this invocation
+  --include-self           include the controller in the fan-out (off by default)
+  --allow-unpinned         let mutating verbs target nodes with no mac= pin
+
+node spec:  [user@]host[:port][,key=value]...
+            fields: port= user= key=<file> auth=pass|key mac=<pin> name=<label>
+            e.g.    192.168.1.2,mac=AA:BB:CC:DD:EE:FF,name=node1
+                    admin@node2.lan:2222,key=/jffs/scripts/node2.key
+
+config: $CONF
+EOF
+}
+
+# --- dispatcher -------------------------------------------------------------
+# Global flags come BEFORE the verb, so that everything after `run` / `install`
+# belongs to the remote command and is never eaten by our own parser.
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run)        DRY_RUN=1; shift ;;
+    --include-self)   INCLUDE_SELF=1; shift ;;
+    --allow-unpinned) ALLOW_UNPINNED=1; shift ;;
+    --nodes)          [ -n "$2" ] || die "--nodes needs a value"; FLEET_NODES=$2; shift 2 ;;
+    -v|--version)     echo "fleetctl $VERSION"; exit 0 ;;
+    -h|--help)        usage; exit 0 ;;
+    --) shift; break ;;
+    -*) die "unknown flag: $1  (flags go before the verb; see 'fleetctl' for usage)" ;;
+    *)  break ;;
+  esac
+done
+
+VERB=$1
+case "$VERB" in
+  setup)     shift; cmd_setup "$@" ;;
+  discover)  cmd_discover ;;
+  nodes)     cmd_nodes ;;
+  run)       shift; cmd_run "$@" ;;
+  push)      shift; cmd_push "$@" ;;
+  install)   shift; cmd_install "$@" ;;
+  health)    cmd_health ;;
+  update)    cmd_update ;;
+  uninstall) cmd_uninstall ;;
+  version|-v|--version) echo "fleetctl $VERSION" ;;
+  *) usage; exit 1 ;;
+esac
