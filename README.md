@@ -115,10 +115,18 @@ Then:
 
 ```sh
 fleetctl discover                 # nodes + a ready-made FLEET_NODES line
-# paste that line into /jffs/scripts/fleetctl.conf
+fleetctl discover --write         # ...or save it straight into the config
 fleetctl nodes                    # auth + eligibility per node
 fleetctl --dry-run run 'uptime'   # confirm the target list before trusting it
 ```
+
+`discover` is read-only by default and prints a block to paste. `--write` folds
+it into the config instead — it backs the old one up to `.bak`, replaces only
+the lines it owns (`FLEET_NODES`, and `FLEET_USER` when it learned one),
+re-runs it through `sh -n`, and refuses to install a config that would not
+parse. The installer never runs discovery for you: it needs credentials that
+may not exist yet, it can legitimately fail, and it would be writing your
+config on your behalf during an install.
 
 ## Zero config where it can be
 
@@ -158,7 +166,7 @@ The single remote device case needs no special support either: one spec in
 
 | Verb | What it does | Needs |
 |---|---|---|
-| `discover` | parse `cfg_device_list` → pinned, conf-ready node specs | — |
+| `discover [--write]` | parse `cfg_device_list` → pinned, conf-ready node specs; `--write` saves them | — |
 | `nodes` | per-node auth / model / pin / eligibility | SSH |
 | `run <cmd…>` | run a command on every node, output prefixed `[node]` | SSH |
 | `push <local> <remote>` | copy a file to every eligible node, atomically | SSH + Merlin |
@@ -177,6 +185,8 @@ the remote command:
 | `--include-self` | include the controller in the fan-out (off by default) |
 | `--allow-unpinned` | let mutating verbs target nodes with no `mac=` pin |
 | `--porcelain` | machine-readable per-node results, for consuming addons |
+| `--write` | (`discover`) save the result into the config, keeping a `.bak` |
+| `--yes` | (`install`/`push`) confirm the fan-out without a terminal |
 
 ## Node specs — one list, however your mesh is reachable
 

@@ -99,6 +99,7 @@ INCLUDE_SELF=0
 ALLOW_UNPINNED=0
 PORCELAIN=0
 ASSUME_YES=0
+WRITE_CONF=0
 
 # Per-node identity + eligibility, in ONE round trip. The __fleetprobe__ token
 # marks OUR line so a login banner can't be mistaken for the answer. An empty
@@ -244,7 +245,7 @@ _password_for() {
 # found", a false negative that reads as "missing"). Same discipline for
 # dbclient's OWN flags: an unknown flag makes dbclient exit before connecting,
 # so -K/-M are used only if this build advertises them.
-SSH_BIN=""; SSH_FLAVOR=""; DB_HAS_K=0; DB_HAS_M=0
+SSH_BIN=""; SSH_FLAVOR=""; DB_HAS_K=0; DB_HAS_M=0; DB_HAS_BATCH=0
 _detect_ssh() {
   [ -n "$SSH_BIN" ] && return 0
   if which dbclient >/dev/null 2>&1; then SSH_BIN=dbclient; SSH_FLAVOR=dropbear
@@ -259,6 +260,14 @@ _detect_ssh() {
     _h=$("$SSH_BIN" -h 2>&1)
     echo "$_h" | grep -q '^-K ' && DB_HAS_K=1     # keepalive => dead peers are noticed
     echo "$_h" | grep -q '^-M ' && DB_HAS_M=1     # in-client max session duration
+    # BatchMode stops dbclient falling back to an INTERACTIVE password prompt.
+    # Observed on hardware 2026-07-28: probing a node with no usable key made
+    # dbclient print "user@host's password:" and wait. It failed fast only
+    # because backgrounded children get /dev/null on stdin — take that prop
+    # away and a fan-out sits at a prompt forever. Probe for the option by
+    # NAME rather than assuming: an unknown -o makes dbclient exit before it
+    # connects, which would be worse than the problem.
+    "$SSH_BIN" -o help 2>&1 | grep -q '^[[:space:]]*BatchMode' && DB_HAS_BATCH=1
   fi
   # ROUTER ONLY: keep TOFU state in fleetctl's own known_hosts rather than
   # root's. It lives on /jffs because it must survive reboots — a few hundred
@@ -295,6 +304,8 @@ _ssh_opts() {
     # changed key means a firmware reflash or someone spoofing the address —
     # the user must decide which, so we surface it instead of accepting it.
     [ "$FLEET_STRICT_HOSTKEY" = "1" ] || o="$o -y"
+    # Never prompt unless the operator explicitly opted into password auth.
+    [ "$DB_HAS_BATCH" = "1" ] && [ "$SPEC_PASS" != "1" ] && o="$o -o BatchMode=yes"
     [ "$DB_HAS_K" = "1" ] && o="$o -K 10"
     # -M is a backstop set just ABOVE our own watchdog, so the watchdog (which
     # can tell us it fired) is what normally trips, and -M only covers the case
@@ -430,8 +441,12 @@ _probe() {
   if [ -z "$_line" ]; then
     if grep -qi 'host key\|HOST KEY' "$_err" 2>/dev/null; then
       P_REASON="HOST KEY MISMATCH — this address answered with a different SSH host key than last time. A firmware reflash explains it; so does someone else holding that address now. Verify, then remove the stale entry from $FLEET_HOME/.ssh/known_hosts"
-    elif grep -qi 'denied\|authentication' "$_err" 2>/dev/null; then
-      P_REASON="SSH auth failed (is the key pasted into the router GUI's SSH authentication key field yet?)"
+    elif grep -qi "password:" "$_err" 2>/dev/null; then
+      # The unit answered, but nothing we hold opened it, so it asked for a
+      # password. fleetctl never answers prompts uninvited.
+      P_REASON="no usable credentials: the unit fell back to asking for a password. Point FLEET_KEY (or key= on this spec) at a key it accepts — or, if you really want password auth, set FLEET_ALLOW_PASSWORD=1 and auth=pass on the spec"
+    elif grep -qi 'denied\|authentication\|exhausted' "$_err" 2>/dev/null; then
+      P_REASON="SSH auth failed: the credentials in your config were rejected by this unit"
     else
       # Flatten ALL of stderr into one line rather than taking the first: on a
       # real auth failure dbclient's first line is a bare "dbclient: " and the
@@ -805,14 +820,49 @@ EOF
   done <<EOF
 $cands
 EOF
+  _specline=$(echo "$specline" | sed 's/ *$//')
   _userline=""
   [ -n "$DISCOVERED_USER" ] && _userline="FLEET_USER=\"$DISCOVERED_USER\"
 "
+
+  # --write: fold the result into the config instead of making the operator
+  # retype a MAC-pinned line over SSH. Opt-in, never the default — the config
+  # is the user's source of truth and a fan-out target list must not change
+  # under them. Safeguards: back up first, rewrite only the lines we own, and
+  # refuse to install a config that does not parse.
+  if [ "$WRITE_CONF" = "1" ]; then
+    _new="$TMPBASE.conf"
+    if [ -f "$CONF" ]; then
+      cp "$CONF" "$CONF.bak" || die "could not back up $CONF"
+      # Keep a FLEET_USER the operator set themselves; only replace it when we
+      # actually learned one from the controller.
+      if [ -n "$DISCOVERED_USER" ]; then
+        grep -vE '^[[:space:]]*(FLEET_NODES|FLEET_USER)=' "$CONF" > "$_new"
+      else
+        grep -vE '^[[:space:]]*FLEET_NODES=' "$CONF" > "$_new"
+      fi
+    else
+      : > "$_new"
+    fi
+    [ -n "$DISCOVERED_USER" ] && printf 'FLEET_USER="%s"\n' "$DISCOVERED_USER" >> "$_new"
+    printf 'FLEET_NODES="%s"\n' "$_specline" >> "$_new"
+    sh -n "$_new" 2>/dev/null || die "refusing to write: the resulting config would not parse — yours is untouched"
+    cat "$_new" > "$CONF" || die "could not write $CONF"
+    echo
+    echo "Wrote $CONF"
+    [ -f "$CONF.bak" ] && echo "  (previous version kept at $CONF.bak)"
+    echo "  FLEET_NODES=\"$_specline\""
+    [ -n "$DISCOVERED_USER" ] && echo "  FLEET_USER=\"$DISCOVERED_USER\""
+    echo
+    echo "Check it before trusting it:  fleetctl nodes"
+    return 0
+  fi
+
   cat <<EOF
 
 Paste this into $CONF:
 $_userline
-FLEET_NODES="$(echo "$specline" | sed 's/ *$//')"
+FLEET_NODES="$_specline"
 
 Notes on that line:
   - The mac= pins are not decoration. FLEET_NODES holds addresses, DHCP moves
@@ -820,6 +870,9 @@ Notes on that line:
     verifies the pin before anything mutating and refuses a mismatch.
   - The [controller] entry is included because an addon usually wants to run on
     every unit, itself included. Delete it if you only want the nodes.
+
+(\`fleetctl discover --write\` puts this straight into the config, keeping a
+ .bak of the previous one.)
 EOF
 }
 
@@ -1155,6 +1208,8 @@ flags (before the verb):
   --nodes "<spec> ..."     override FLEET_NODES for this invocation
   --include-self           include the controller in the fan-out (off by default)
   --allow-unpinned         let mutating verbs target nodes with no mac= pin
+  --write                  (discover) save the result into the config, with a .bak
+  --yes                    (install/push) confirm the fan-out non-interactively
 
 node spec:  [user@]host[:port][,key=value]...  |  self
             fields: port= user= key=<file> auth=pass|key mac=<pin> name=<label>
@@ -1178,6 +1233,7 @@ while [ $# -gt 0 ]; do
     --allow-unpinned) ALLOW_UNPINNED=1; shift ;;
     --porcelain)      PORCELAIN=1; shift ;;
     --yes|-y)         ASSUME_YES=1; shift ;;
+    --write)          WRITE_CONF=1; shift ;;
     --nodes)          [ -n "$2" ] || die "--nodes needs a value"; FLEET_NODES=$2; shift 2 ;;
     -v|--version)     echo "fleetctl $VERSION"; exit 0 ;;
     -h|--help)        usage; exit 0 ;;

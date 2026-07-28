@@ -56,6 +56,10 @@ if [ "$1" = "-h" ]; then
     '-K <keepalive>  (0 is never, default 0)' '-M <max_duration>  (0 is off, default 0, in seconds)'
   exit 0
 fi
+if [ "$1" = "-o" ] && [ "$2" = "help" ]; then
+  printf '%s\n' 'dbclient: Available options:' '  BatchMode' '  PasswordAuthentication'
+  exit 1
+fi
 printf 'ARGS: %s\n' "$*" >> "$FLEET_TEST_DIR/sshlog"
 target=""; cmd=""
 while [ $# -gt 0 ]; do
@@ -74,6 +78,7 @@ auth=ok; model=""; jffs=""; dir=no; on=1; macs=""; rc=0; sleepsec=0
 case "$auth" in
   ok) : ;;
   hostkey) echo "Host key mismatch for $host !" >&2; exit 255 ;;
+  prompt)  printf "%s@%s's password: " "${target%%@*}" "$host" >&2; exit 255 ;;
   *) echo "dbclient: Authentication failed" >&2; exit 255 ;;
 esac
 case "$cmd" in
@@ -145,7 +150,7 @@ reset() {
   host_fixture 192.168.1.3   ok    RP-NODE-B    ""   no  "AA:BB:CC:DD:EE:03,"     0  0   # stock node
   host_fixture 192.168.1.4   deny  ""           ""   no  ""                       0  0   # auth fails
   host_fixture 192.168.1.5   hostkey ""         ""   no  ""                       0  0   # host key changed
-  : > "$FLEETCTL_CONF"
+  : > "$FLEETCTL_CONF"; rm -f "$FLEETCTL_CONF.bak"
 }
 conf() { printf '%s\n' "$@" > "$FLEETCTL_CONF"; }
 KEY="$TMP/fleetctl.key"
@@ -207,6 +212,25 @@ nonzero "discover: unknown format exits non-zero" "$rc"
 has  "discover: unknown format prints the raw value" "$out" "SOMETHING-UNPARSEABLE-FROM-OTHER-FIRMWARE"
 has  "discover: unknown format falls back to manual" "$out" "by hand"
 
+# discover --write: opt-in, backs up, and never leaves an unparseable config
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_CONTROLLER="self"' 'FLEET_ALLOW_PASSWORD=0'
+out=$(run --write discover 2>&1)
+has  "--write: reports what it wrote"          "$out" "Wrote $FLEETCTL_CONF"
+has  "--write: config now holds the fleet"     "$(cat "$FLEETCTL_CONF")" "192.168.1.2,mac=AA:BB:CC:DD:EE:02"
+has  "--write: unrelated settings preserved"   "$(cat "$FLEETCTL_CONF")" "FLEET_ALLOW_PASSWORD=0"
+is   "--write: previous config kept as .bak"   "$([ -f "$FLEETCTL_CONF.bak" ] && echo y)" "y"
+is   "--write: result parses as shell"         "$(sh -n "$FLEETCTL_CONF" 2>&1; echo rc=$?)" "rc=0"
+
+# writing twice must not accumulate duplicate FLEET_NODES lines
+run --write discover >/dev/null 2>&1
+is   "--write: idempotent, one FLEET_NODES line" "$(grep -c '^FLEET_NODES=' "$FLEETCTL_CONF")" "1"
+
+# without the flag it stays read-only
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_CONTROLLER="self"' 'FLEET_NODES=""'
+run discover >/dev/null 2>&1
+has  "discover: writes nothing without --write" "$(cat "$FLEETCTL_CONF")" 'FLEET_NODES=""'
+is   "discover: leaves no .bak behind"         "$([ -f "$FLEETCTL_CONF.bak" ] && echo y)" ""
+
 # === self / local target ====================================================
 echo "-- self (local execution)"
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="self"'
@@ -262,6 +286,18 @@ reset; conf 'FLEET_NODES="192.168.1.2,mac=AA:BB:CC:DD:EE:02"' "FLEET_KEY=\"$TMP/
 out=$(run health 2>&1); rc=$?
 has  "workstation: a missing key is not a failure" "$out" "credentials your SSH client already has"
 is   "workstation: health still passes"       "$rc" "0"
+
+# a unit that falls back to asking for a password must be diagnosed, not echoed
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.7"'
+host_fixture 192.168.1.7 prompt "" "" no "" 0 0
+out=$(run nodes 2>&1)
+has  "password prompt: diagnosed as missing credentials" "$out" "no usable credentials"
+has  "password prompt: says how to fix it"      "$out" "FLEET_KEY"
+hasnt "password prompt: does not echo the prompt back" "$out" "'s password:"
+
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="192.168.1.2"'
+run nodes >/dev/null 2>&1
+has  "batchmode: dbclient told never to prompt" "$(cat "$TMP/sshlog")" "BatchMode=yes"
 
 # === node specs =============================================================
 echo "-- node specs"
