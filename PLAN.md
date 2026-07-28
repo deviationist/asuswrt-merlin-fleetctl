@@ -242,6 +242,33 @@ live controller and node — read-only)
 - Controller JFFS headroom: 44.5 MB total, 40 MB free — fleetctl plus addons is
   not a space concern.
 
+**2026-07-28** (FIRST REAL RUN — fleetctl executed against the live mesh from a
+workstation, read-only, zero writes to any router)
+
+Everything below is now proven on hardware, not mocks:
+
+- `discover` fetched `cfg_device_list` from the controller over SSH, parsed it,
+  probed both units, and emitted a conf-ready pinned line.
+- `nodes` (and `nodes --porcelain`) reported both units with pins verified.
+- `run 'nvram get productid'` executed on both units — summary `2 ok`.
+- `install --dry-run` correctly marked the stock node permanently ineligible
+  and the controller as the only eligible target; nothing was executed.
+- The consent gate refused an unattended `install`.
+
+Two real usability bugs surfaced that no mock could have caught, both fixed:
+
+1. **Discovery yields bare IPs, and a bare IP does not inherit the operator's
+   `~/.ssh/config` Host block.** The controller hop worked (via the alias) but
+   every per-node probe then failed auth. Fix: discovery asks the controller
+   for `http_username` — AiMesh syncs the admin user mesh-wide — and uses it as
+   the default user, and includes `FLEET_USER=` in the suggested config.
+2. **Controller auto-detection hands back the gateway ADDRESS**, which has the
+   same problem. It now says so when auth fails, and suggests naming the SSH
+   alias instead.
+
+Still unproven on hardware: fleetctl running **on** the router (the
+`PLATFORM=router` paths), and any mutating verb.
+
 ## Open questions
 
 Ordered by how much they affect real users.
