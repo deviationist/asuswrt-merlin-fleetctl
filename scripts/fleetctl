@@ -1031,13 +1031,24 @@ cmd_install() {
   # busybox sh is still reading it incrementally — undefined behavior, and the
   # reason `update` exists (it execs the installer from /tmp first). Catch the
   # foot-gun rather than documenting it and hoping.
-  case "$url" in
-    *fleetctl*)
-      for _s in $FLEET_NODES; do
-        _parse_spec "$_s"
-        [ "$SPEC_LOCAL" = "1" ] && die "that looks like fleetctl's own installer, and '$SPEC_RAW' is this machine — installing over a running script is undefined. Use 'fleetctl update' for self, and remove 'self' from FLEET_NODES to push fleetctl to the others."
-      done ;;
+  # Match the INSTALLER, not the URL. Matching anywhere in the URL was far too
+  # broad: every file in this repo lives under a path containing "fleetctl", so
+  # it blocked extras/canary.sh — the one installer specifically built to be
+  # safe to run here — and would block any addon hosted in a repo whose name
+  # happens to contain the word.
+  _base=${url##*/}; _base=${_base%%\?*}
+  _selfinstall=0
+  case "$_base" in
+    fleetctl|fleetctl.sh) _selfinstall=1 ;;
+    install.sh|uninstall.sh)
+      case "$url" in *fleetctl*) _selfinstall=1 ;; esac ;;
   esac
+  if [ "$_selfinstall" = "1" ]; then
+    for _s in $FLEET_NODES; do
+      _parse_spec "$_s"
+      [ "$SPEC_LOCAL" = "1" ] && die "that looks like fleetctl's own installer ($_base), and '$SPEC_RAW' is this machine — installing over a running script is undefined. Use 'fleetctl update' for self, and remove 'self' from FLEET_NODES to push fleetctl to the others."
+    done
+  fi
   _lock
   args="$*"
   [ "$DRY_RUN" = "1" ] && echo "DRY RUN — nothing will be installed."

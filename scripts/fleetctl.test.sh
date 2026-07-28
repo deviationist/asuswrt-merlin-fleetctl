@@ -270,6 +270,19 @@ has  "self: refuses to install fleetctl over itself" "$out" "installing over a r
 has  "self: points at 'update' instead"       "$out" "fleetctl update"
 nonzero "self: self-install refusal exits non-zero" "$rc"
 
+# ...but the guard keys on the INSTALLER, not the URL: every file in this repo
+# sits under a path containing "fleetctl", including the canary built to be run
+# here, and so does any addon in a similarly-named repo
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="self"'
+out=$(run --yes install https://example.invalid/asuswrt-merlin-fleetctl/main/extras/canary.sh 2>&1)
+hasnt "self-install guard: does not block a sibling script" "$out" "installing over a running script"
+has  "self-install guard: canary actually runs"  "$out" "Installed and HEALING"
+
+reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="self"'
+out=$(run --yes install https://example.invalid/asuswrt-merlin-fleetctl/main/scripts/fleetctl 2>&1); rc=$?
+has  "self-install guard: still catches the raw tool" "$out" "installing over a running script"
+nonzero "self-install guard: raw tool refusal exits non-zero" "$rc"
+
 # an explicit `self` is opt-in, so --include-self must not be needed for it
 reset; withkey; conf "FLEET_KEY=\"$KEY\"" 'FLEET_NODES="self"'
 out=$(run run 'echo NO-FLAG-NEEDED' 2>&1)
